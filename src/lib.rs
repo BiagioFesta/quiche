@@ -440,6 +440,7 @@ pub struct Config {
 
     dgram_recv_max_queue_len: usize,
     dgram_send_max_queue_len: usize,
+    dgram_ignore_cc: bool,
 }
 
 impl Config {
@@ -465,6 +466,7 @@ impl Config {
 
             dgram_recv_max_queue_len: DEFAULT_MAX_DGRAM_QUEUE_LEN,
             dgram_send_max_queue_len: DEFAULT_MAX_DGRAM_QUEUE_LEN,
+            dgram_ignore_cc: false,
         })
     }
 
@@ -769,6 +771,18 @@ impl Config {
         self.dgram_recv_max_queue_len = recv_queue_len;
         self.dgram_send_max_queue_len = send_queue_len;
     }
+
+    /// Configure whether datagrams should ignore congestion controll or not.
+    /// When this flag is enabled (`true`), the effects are:
+    ///    * Packets containg datagram frames are not bounded by CWND
+    ///      (i.e., window congestion control).
+    ///    * Datagram frames are marked as `NOT ack eliciting` and
+    ///      `NOT in flight`.
+    ///
+    /// The default value is `false`.
+    pub fn enable_dgram_ignore_cc(&mut self, v: bool) {
+        self.dgram_ignore_cc = v
+    }
 }
 
 /// A QUIC connection.
@@ -922,6 +936,7 @@ pub struct Connection {
     /// DATAGRAM queues.
     dgram_recv_queue: dgram::DatagramQueue,
     dgram_send_queue: dgram::DatagramQueue,
+    dgram_ignore_cc: bool,
 }
 
 /// Creates a new server-side connection.
@@ -1236,6 +1251,8 @@ impl Connection {
             dgram_send_queue: dgram::DatagramQueue::new(
                 config.dgram_send_max_queue_len,
             ),
+
+            dgram_ignore_cc: config.dgram_ignore_cc,
         });
 
         if let Some(odcid) = odcid {
@@ -2025,8 +2042,14 @@ impl Connection {
         // Limit output packet size to respect peer's max_packet_size limit.
         left = cmp::min(left, self.max_send_udp_payload_len());
 
-        // Limit output packet size by congestion window size.
-        left = cmp::min(left, self.recovery.cwnd_available());
+        let ignore_cc = self.dgram_send_queue.has_pending() &&
+            self.dgram_ignore_cc;
+
+        // If there are datagrams pending, do not limit by congestion window.
+        if !ignore_cc {
+            // Limit output packet size by congestion window size.
+            left = cmp::min(left, self.recovery.cwnd_available());
+        }
 
         // Limit data sent by the server based on the amount of data received
         // from the client before its address is validated.
@@ -2335,8 +2358,8 @@ impl Connection {
                                     payload_len,
                                     left
                                 ) {
-                                    ack_eliciting = true;
-                                    in_flight = true;
+                                    ack_eliciting = !self.dgram_ignore_cc;
+                                    in_flight = !self.dgram_ignore_cc;
                                 }
                             },
 

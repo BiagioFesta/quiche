@@ -33,39 +33,17 @@ use std::io::prelude::*;
 
 use std::collections::HashMap;
 
+use std::rc::Rc;
+
+use std::cell::RefCell;
+
 use ring::rand::*;
 
-use quiche_apps::*;
+use quiche_apps::args::*;
+
+use quiche_apps::common::*;
 
 const MAX_DATAGRAM_SIZE: usize = 1350;
-
-const USAGE: &str = "Usage:
-  quiche-server [options]
-  quiche-server -h | --help
-
-Options:
-  --listen <addr>             Listen on the given IP:port [default: 127.0.0.1:4433]
-  --cert <file>               TLS certificate path [default: src/bin/cert.crt]
-  --key <file>                TLS certificate key path [default: src/bin/cert.key]
-  --root <dir>                Root directory [default: src/bin/root/]
-  --index <name>              The file that will be used as index [default: index.html].
-  --name <str>                Name of the server [default: quic.tech]
-  --max-data BYTES            Connection-wide flow control limit [default: 10000000].
-  --max-stream-data BYTES     Per-stream flow control limit [default: 1000000].
-  --max-streams-bidi STREAMS  Number of allowed concurrent streams [default: 100].
-  --max-streams-uni STREAMS   Number of allowed concurrent streams [default: 100].
-  --dump-packets PATH         Dump the incoming packets as files in the given directory.
-  --early-data                Enables receiving early data.
-  --no-retry                  Disable stateless retry.
-  --no-grease                 Don't send GREASE.
-  --http-version VERSION      HTTP version to use [default: all].
-  --dgram-proto PROTO         DATAGRAM application protocol to use [default: none].
-  --dgram-count COUNT         Number of DATAGRAMs to send [default: 0].
-  --dgram-data DATA           Data to send for certain types of DATAGRAM application protocol [default: brrr].
-  --cc-algorithm NAME         Specify which congestion control algorithm to use [default: cubic].
-  --disable-hystart           Disable HyStart++.
-  -h --help                   Show this screen.
-";
 
 fn main() {
     let mut buf = [0; 65535];
@@ -76,7 +54,7 @@ fn main() {
         .init();
 
     // Parse CLI parameters.
-    let docopt = docopt::Docopt::new(USAGE).unwrap();
+    let docopt = docopt::Docopt::new(SERVER_USAGE).unwrap();
     let conn_args = CommonArgs::with_docopt(&docopt);
     let args = ServerArgs::with_docopt(&docopt);
 
@@ -106,8 +84,9 @@ fn main() {
 
     config.set_application_protos(&conn_args.alpns).unwrap();
 
-    config.set_max_idle_timeout(30000);
-    config.set_max_udp_payload_size(MAX_DATAGRAM_SIZE as u64);
+    config.set_max_idle_timeout(conn_args.idle_timeout);
+    config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
+    config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
     config.set_initial_max_data(conn_args.max_data);
     config.set_initial_max_stream_data_bidi_local(conn_args.max_stream_data);
     config.set_initial_max_stream_data_bidi_remote(conn_args.max_stream_data);
@@ -130,7 +109,7 @@ fn main() {
         config.log_keys();
     }
 
-    if args.early_data {
+    if conn_args.early_data {
         config.enable_early_data();
     }
 
@@ -228,11 +207,12 @@ fn main() {
 
             let conn_id = ring::hmac::sign(&conn_id_seed, &hdr.dcid);
             let conn_id = &conn_id.as_ref()[..quiche::MAX_CONN_ID_LEN];
+            let conn_id = conn_id.to_vec().into();
 
             // Lookup a connection based on the packet's connection ID. If there
             // is no connection matching, create a new one.
             let (_, client) = if !clients.contains_key(&hdr.dcid) &&
-                !clients.contains_key(conn_id)
+                !clients.contains_key(&conn_id)
             {
                 if hdr.ty != quiche::Type::Initial {
                     error!("Packet is not Initial");
@@ -272,6 +252,7 @@ fn main() {
                     if token.is_empty() {
                         warn!("Doing stateless retry");
 
+                        let scid = quiche::ConnectionId::from_ref(&scid);
                         let new_token = mint_token(&hdr, &src);
 
                         let len = quiche::retry(
@@ -301,7 +282,7 @@ fn main() {
 
                     // The token was not valid, meaning the retry failed, so
                     // drop the packet.
-                    if odcid == None {
+                    if odcid.is_none() {
                         error!("Invalid address validation token");
                         continue;
                     }
@@ -316,15 +297,13 @@ fn main() {
                     scid.copy_from_slice(&hdr.dcid);
                 }
 
-                debug!(
-                    "New connection: src={} dcid={} scid={}",
-                    src,
-                    hex_dump(&hdr.dcid),
-                    hex_dump(&scid)
-                );
+                let scid = quiche::ConnectionId::from_vec(scid.to_vec());
+
+                debug!("New connection: dcid={:?} scid={:?}", hdr.dcid, scid);
 
                 #[allow(unused_mut)]
-                let mut conn = quiche::accept(&scid, odcid, &mut config).unwrap();
+                let mut conn =
+                    quiche::accept(&scid, odcid.as_ref(), &mut config).unwrap();
 
                 if let Some(keylog) = &mut keylog {
                     if let Ok(keylog) = keylog.try_clone() {
@@ -336,7 +315,7 @@ fn main() {
                 #[cfg(feature = "qlog")]
                 {
                     if let Some(dir) = std::env::var_os("QLOGDIR") {
-                        let id = hex_dump(&scid);
+                        let id = format!("{:?}", &scid);
                         let writer = make_qlog_writer(&dir, "server", &id);
 
                         conn.set_qlog(
@@ -356,14 +335,14 @@ fn main() {
                     app_proto_selected: false,
                 };
 
-                clients.insert(scid.to_vec(), (src, client));
+                clients.insert(scid.clone(), (src, client));
 
-                clients.get_mut(&scid[..]).unwrap()
+                clients.get_mut(&scid).unwrap()
             } else {
                 match clients.get_mut(&hdr.dcid) {
                     Some(v) => v,
 
-                    None => clients.get_mut(conn_id).unwrap(),
+                    None => clients.get_mut(&conn_id).unwrap(),
                 }
             };
 
@@ -413,6 +392,7 @@ fn main() {
                     client.http_conn = Some(Http3Conn::with_conn(
                         &mut client.conn,
                         dgram_sender,
+                        Rc::new(RefCell::new(stdout_sink)),
                     ));
 
                     client.app_proto_selected = true;
@@ -547,7 +527,7 @@ fn mint_token(hdr: &quiche::Header, src: &net::SocketAddr) -> Vec<u8> {
 /// authenticate of the token. *It should not be used in production system*.
 fn validate_token<'a>(
     src: &net::SocketAddr, token: &'a [u8],
-) -> Option<&'a [u8]> {
+) -> Option<quiche::ConnectionId<'a>> {
     if token.len() < 6 {
         return None;
     }
@@ -567,42 +547,5 @@ fn validate_token<'a>(
         return None;
     }
 
-    let token = &token[addr.len()..];
-
-    Some(&token[..])
-}
-
-// Application-specific arguments that compliment the `CommonArgs`.
-struct ServerArgs {
-    listen: String,
-    no_retry: bool,
-    root: String,
-    index: String,
-    cert: String,
-    key: String,
-    early_data: bool,
-}
-
-impl Args for ServerArgs {
-    fn with_docopt(docopt: &docopt::Docopt) -> Self {
-        let args = docopt.parse().unwrap_or_else(|e| e.exit());
-
-        let listen = args.get_str("--listen").to_string();
-        let no_retry = args.get_bool("--no-retry");
-        let early_data = args.get_bool("--early-data");
-        let root = args.get_str("--root").to_string();
-        let index = args.get_str("--index").to_string();
-        let cert = args.get_str("--cert").to_string();
-        let key = args.get_str("--key").to_string();
-
-        ServerArgs {
-            listen,
-            no_retry,
-            root,
-            index,
-            cert,
-            key,
-            early_data,
-        }
-    }
+    Some(quiche::ConnectionId::from_ref(&token[addr.len()..]))
 }

@@ -26,7 +26,11 @@
 
 use std::cmp;
 
+use std::sync::Arc;
+use std::sync::RwLock;
+
 use std::collections::hash_map;
+
 use std::collections::BTreeMap;
 use std::collections::BinaryHeap;
 use std::collections::HashMap;
@@ -39,6 +43,12 @@ use crate::Result;
 use crate::ranges;
 
 const DEFAULT_URGENCY: u8 = 127;
+
+#[cfg(test)]
+const SEND_BUFFER_SIZE: usize = 5;
+
+#[cfg(not(test))]
+const SEND_BUFFER_SIZE: usize = 4096;
 
 /// Keeps track of QUIC streams and enforces stream limits.
 #[derive(Default)]
@@ -113,6 +123,16 @@ pub struct StreamMap {
     /// of the map elements represents the offset of the stream at which the
     /// blocking occurred.
     blocked: HashMap<u64, u64>,
+
+    /// Set of stream IDs corresponding to streams that are reset. The value
+    /// of the map elements is a tuple of the error code and final size values
+    /// to include in the RESET_STREAM frame.
+    reset: HashMap<u64, (u64, u64)>,
+
+    /// Set of stream IDs corresponding to streams that are shutdown on the
+    /// receive side, and need to send a STOP_SENDING frame. The value of the
+    /// map elements is the error code to include in the STOP_SENDING frame.
+    stopped: HashMap<u64, u64>,
 }
 
 impl StreamMap {
@@ -355,6 +375,34 @@ impl StreamMap {
         }
     }
 
+    /// Adds or removes the stream ID to/from the reset streams set with the
+    /// given error code and final size values.
+    ///
+    /// If the stream was already in the list, this does nothing.
+    pub fn mark_reset(
+        &mut self, stream_id: u64, reset: bool, error_code: u64, final_size: u64,
+    ) {
+        if reset {
+            self.reset.insert(stream_id, (error_code, final_size));
+        } else {
+            self.reset.remove(&stream_id);
+        }
+    }
+
+    /// Adds or removes the stream ID to/from the stopped streams set with the
+    /// given error code.
+    ///
+    /// If the stream was already in the list, this does nothing.
+    pub fn mark_stopped(
+        &mut self, stream_id: u64, stopped: bool, error_code: u64,
+    ) {
+        if stopped {
+            self.stopped.insert(stream_id, error_code);
+        } else {
+            self.stopped.remove(&stream_id);
+        }
+    }
+
     /// Updates the peer's maximum bidirectional stream count limit.
     pub fn update_peer_max_streams_bidi(&mut self, v: u64) {
         self.peer_max_streams_bidi = cmp::max(self.peer_max_streams_bidi, v);
@@ -383,6 +431,18 @@ impl StreamMap {
     /// Returns the new max_streams_uni limit.
     pub fn max_streams_uni_next(&mut self) -> u64 {
         self.local_max_streams_uni_next
+    }
+
+    /// Returns the number of bidirectional streams that can be created
+    /// before the peer's stream count limit is reached.
+    pub fn peer_streams_left_bidi(&self) -> u64 {
+        self.peer_max_streams_bidi - self.local_opened_streams_bidi
+    }
+
+    /// Returns the number of unidirectional streams that can be created
+    /// before the peer's stream count limit is reached.
+    pub fn peer_streams_left_uni(&self) -> u64 {
+        self.peer_max_streams_uni - self.local_opened_streams_uni
     }
 
     /// Drops completed stream.
@@ -426,9 +486,24 @@ impl StreamMap {
         self.blocked.iter()
     }
 
+    /// Creates an iterator over streams that need to send RESET_STREAM.
+    pub fn reset(&self) -> hash_map::Iter<u64, (u64, u64)> {
+        self.reset.iter()
+    }
+
+    /// Creates an iterator over streams that need to send STOP_SENDING.
+    pub fn stopped(&self) -> hash_map::Iter<u64, u64> {
+        self.stopped.iter()
+    }
+
     /// Returns true if there are any streams that have data to write.
     pub fn has_flushable(&self) -> bool {
         !self.flushable.is_empty()
+    }
+
+    /// Returns true if there are any streams that have data to read.
+    pub fn has_readable(&self) -> bool {
+        !self.readable.is_empty()
     }
 
     /// Returns true if there are any streams that need to update the local
@@ -440,6 +515,16 @@ impl StreamMap {
     /// Returns true if there are any streams that are blocked.
     pub fn has_blocked(&self) -> bool {
         !self.blocked.is_empty()
+    }
+
+    /// Returns true if there are any streams that are reset.
+    pub fn has_reset(&self) -> bool {
+        !self.reset.is_empty()
+    }
+
+    /// Returns true if there are any streams that need to send STOP_SENDING.
+    pub fn has_stopped(&self) -> bool {
+        !self.stopped.is_empty()
     }
 
     /// Returns true if the max bidirectional streams count needs to be updated
@@ -481,7 +566,7 @@ pub struct Stream {
     pub local: bool,
 
     /// Application data.
-    pub data: Option<Box<dyn Send + std::any::Any>>,
+    pub data: Option<Box<dyn std::any::Any + Send + Sync>>,
 
     /// The stream's urgency (lower is better). Default is `DEFAULT_URGENCY`.
     pub urgency: u8,
@@ -568,6 +653,7 @@ pub struct StreamIter {
 }
 
 impl StreamIter {
+    #[inline]
     fn from(streams: &HashSet<u64>) -> Self {
         StreamIter {
             streams: streams.iter().copied().collect(),
@@ -578,12 +664,14 @@ impl StreamIter {
 impl Iterator for StreamIter {
     type Item = u64;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         self.streams.pop()
     }
 }
 
 impl ExactSizeIterator for StreamIter {
+    #[inline]
     fn len(&self) -> usize {
         self.streams.len()
     }
@@ -634,7 +722,7 @@ impl RecvBuf {
     /// This also takes care of enforcing stream flow control limits, as well
     /// as handling incoming data that overlaps data that is already in the
     /// buffer.
-    pub fn push(&mut self, buf: RangeBuf) -> Result<()> {
+    pub fn write(&mut self, buf: RangeBuf) -> Result<()> {
         if buf.max_off() > self.max_data {
             return Err(Error::FlowControl);
         }
@@ -690,10 +778,6 @@ impl RecvBuf {
             }
         }
 
-        if self.drain {
-            return Ok(());
-        }
-
         let mut tmp_buf = Some(buf);
 
         while let Some(mut buf) = tmp_buf {
@@ -727,7 +811,9 @@ impl RecvBuf {
 
             self.len = cmp::max(self.len, buf.max_off());
 
-            self.data.push(buf);
+            if !self.drain {
+                self.data.push(buf);
+            }
         }
 
         Ok(())
@@ -742,7 +828,7 @@ impl RecvBuf {
     ///
     /// On success the amount of data read, and a flag indicating if there is
     /// no more data in the buffer, are returned as a tuple.
-    pub fn pop(&mut self, out: &mut [u8]) -> Result<(usize, bool)> {
+    pub fn emit(&mut self, out: &mut [u8]) -> Result<(usize, bool)> {
         let mut len = 0;
         let mut cap = out.len();
 
@@ -759,7 +845,7 @@ impl RecvBuf {
 
             let buf_len = cmp::min(buf.len(), cap);
 
-            out[len..len + buf_len].copy_from_slice(&buf[..buf_len]);
+            buf.with(|s| out[len..len + buf_len].copy_from_slice(&s[..buf_len]));
 
             self.off += buf_len as u64;
 
@@ -822,12 +908,14 @@ impl RecvBuf {
 
         self.data.clear();
 
+        self.off = self.max_off();
+
         Ok(())
     }
 
-    /// Returns the largest offset of data buffered.
+    /// Returns the lowest offset of data buffered.
     #[allow(dead_code)]
-    pub fn off_back(&self) -> u64 {
+    pub fn off_front(&self) -> u64 {
         self.off
     }
 
@@ -838,6 +926,11 @@ impl RecvBuf {
         self.fin_off.is_none() &&
             self.max_data_next != self.max_data &&
             self.max_data_next / 2 > self.max_data - self.len
+    }
+
+    /// Returns the largest offset ever received.
+    pub fn max_off(&self) -> u64 {
+        self.len
     }
 
     /// Returns true if the receive-side of the stream is complete.
@@ -876,12 +969,15 @@ impl RecvBuf {
 #[derive(Debug, Default)]
 pub struct SendBuf {
     /// Chunks of data to be sent, ordered by offset.
-    data: BinaryHeap<RangeBuf>,
+    data: VecDeque<RangeBuf>,
+
+    /// The index of the buffer that needs to be sent next.
+    pos: usize,
 
     /// The maximum offset of data buffered in the stream.
     off: u64,
 
-    /// The amount of data that was ever written to this stream.
+    /// The amount of data currently buffered.
     len: u64,
 
     /// The maximum offset we are allowed to send to the peer.
@@ -895,6 +991,9 @@ pub struct SendBuf {
 
     /// Ranges of data offsets that have been acked.
     acked: ranges::RangeSet,
+
+    /// The error code received via STOP_SENDING.
+    error: Option<u64>,
 }
 
 impl SendBuf {
@@ -911,122 +1010,145 @@ impl SendBuf {
     /// The number of bytes that were actually stored in the buffer is returned
     /// (this may be lower than the size of the input buffer, in case of partial
     /// writes).
-    pub fn push_slice(
-        &mut self, mut data: &[u8], mut fin: bool,
-    ) -> Result<usize> {
-        if self.shutdown {
-            // Since we won't write any more data anyway, pretend that we sent
-            // all data that was passed in.
-            return Ok(data.len());
-        }
+    pub fn write(&mut self, mut data: &[u8], mut fin: bool) -> Result<usize> {
+        let max_off = self.off + data.len() as u64;
 
-        if data.is_empty() {
-            // Create a dummy range buffer, in order to propagate the `fin` flag
-            // into `RangeBuf::push()`. This will be discarded later on.
-            let buf = RangeBuf::from(&[], self.off, fin);
+        // Get the stream send capacity. This will return an error if the stream
+        // was stopped.
+        let capacity = self.cap()?;
 
-            return self.push(buf).map(|_| 0);
-        }
-
-        if data.len() > self.cap() {
+        if data.len() > capacity {
             // Truncate the input buffer according to the stream's capacity.
-            let len = self.cap();
+            let len = capacity;
             data = &data[..len];
 
             // We are not buffering the full input, so clear the fin flag.
             fin = false;
         }
 
-        let buf = RangeBuf::from(data, self.off, fin);
-        self.push(buf)?;
-
-        self.off += data.len() as u64;
-
-        Ok(data.len())
-    }
-
-    /// Inserts the given chunk of data in the buffer.
-    pub fn push(&mut self, buf: RangeBuf) -> Result<()> {
         if let Some(fin_off) = self.fin_off {
             // Can't write past final offset.
-            if buf.max_off() > fin_off {
+            if max_off > fin_off {
                 return Err(Error::FinalSize);
             }
 
             // Can't "undo" final offset.
-            if buf.max_off() == fin_off && !buf.fin() {
+            if max_off == fin_off && !fin {
                 return Err(Error::FinalSize);
             }
         }
 
-        if self.shutdown {
-            return Ok(());
-        }
-
-        if buf.fin() {
-            self.fin_off = Some(buf.max_off());
+        if fin {
+            self.fin_off = Some(max_off);
         }
 
         // Don't queue data that was already fully acked.
-        if self.ack_off() >= buf.max_off() {
-            return Ok(());
+        if self.ack_off() >= max_off {
+            return Ok(data.len());
         }
-
-        self.len += buf.len() as u64;
 
         // We already recorded the final offset, so we can just discard the
         // empty buffer now.
-        if buf.is_empty() {
-            return Ok(());
+        if data.is_empty() {
+            return Ok(data.len());
         }
 
-        self.data.push(buf);
+        let mut len = 0;
 
-        Ok(())
+        // Try to fill the last buffer in the queue first, if it has capacity.
+        if let Some(back) = self.data.back_mut() {
+            let spare = back.spare_capacity();
+
+            if spare > 0 {
+                len = cmp::min(spare, data.len());
+
+                back.extend_from_slice(&data[..len])?;
+
+                back.fin = len == data.len() && fin;
+
+                self.off += len as u64;
+                self.len += len as u64;
+
+                data = &data[len..];
+
+                if !back.is_empty() {
+                    self.pos = cmp::min(self.pos, self.data.len() - 1);
+                }
+            }
+        }
+
+        // Split the remaining input data into consistently-sized buffers to
+        // avoid fragmentation.
+        for chunk in data.chunks(SEND_BUFFER_SIZE) {
+            len += chunk.len();
+
+            let fin = len == data.len() && fin;
+
+            let buf = RangeBuf::from_with_capacity(
+                chunk,
+                self.off,
+                fin,
+                SEND_BUFFER_SIZE,
+            )?;
+
+            // The new data can simply be appended at the end of the send buffer.
+            self.data.push_back(buf);
+
+            self.off += chunk.len() as u64;
+            self.len += chunk.len() as u64;
+        }
+
+        Ok(len)
     }
 
-    /// Returns contiguous data from the send buffer as a single `RangeBuf`.
-    pub fn pop(&mut self, max_data: usize) -> Result<RangeBuf> {
-        let mut out = RangeBuf::default();
-        out.data =
-            Vec::with_capacity(cmp::min(max_data as u64, self.len) as usize);
-        out.off = self.off;
+    /// Writes data from the send buffer into the given output buffer.
+    pub fn emit(&mut self, out: &mut [u8]) -> Result<(usize, bool)> {
+        let mut out_len = out.len();
+        let out_off = self.off_front();
 
-        let mut out_len = max_data;
-        let mut out_off = self.data.peek().map_or_else(|| out.off, RangeBuf::off);
+        let mut next_off = out_off;
 
         while out_len > 0 &&
             self.ready() &&
-            self.off_front() == out_off &&
+            self.off_front() == next_off &&
             self.off_front() < self.max_data
         {
-            let mut buf = match self.data.peek_mut() {
+            let buf = match self.data.get_mut(self.pos) {
                 Some(v) => v,
 
                 None => break,
             };
 
+            if buf.is_empty() {
+                self.pos += 1;
+                continue;
+            }
+
             let buf_len = cmp::min(buf.len(), out_len);
 
-            if out.is_empty() {
-                out.off = buf.off();
-            }
+            // Copy data to the output buffer.
+            let out_pos = (next_off - out_off) as usize;
+            buf.with(|s| {
+                (&mut out[out_pos..out_pos + buf_len])
+                    .copy_from_slice(&s[..buf_len])
+            });
 
             self.len -= buf_len as u64;
 
             out_len -= buf_len;
-            out_off = buf.off() + buf_len as u64;
 
-            out.data.extend_from_slice(&buf[..buf_len]);
+            next_off = buf.off() + buf_len as u64;
 
-            if buf_len < buf.len() {
+            if !buf.is_empty() && buf_len < buf.len() {
                 buf.consume(buf_len);
 
                 // We reached the maximum capacity, so end here.
                 break;
             }
 
-            std::collections::binary_heap::PeekMut::pop(buf);
+            buf.consume(buf_len);
+
+            self.pos += 1;
         }
 
         // Override the `fin` flag set for the output buffer by matching the
@@ -1035,9 +1157,9 @@ impl SendBuf {
         // This is more efficient than tracking `fin` using the range buffers
         // themselves, and lets us avoid queueing empty buffers just so we can
         // propagate the final size.
-        out.fin = self.fin_off == Some(out.max_off());
+        let fin = self.fin_off == Some(next_off);
 
-        Ok(out)
+        Ok((out.len() - out_len, fin))
     }
 
     /// Updates the max_data limit to the given value.
@@ -1050,17 +1172,138 @@ impl SendBuf {
         self.acked.insert(off..off + len as u64);
     }
 
+    pub fn ack_and_drop(&mut self, off: u64, len: usize) {
+        self.ack(off, len);
+
+        let ack_off = self.ack_off();
+
+        if self.data.is_empty() {
+            return;
+        }
+
+        if off > ack_off {
+            return;
+        }
+
+        let mut drop_until = None;
+
+        // Drop contiguously acked data from the front of the buffer.
+        for (i, buf) in self.data.iter_mut().enumerate() {
+            // Newly acked range is past highest contiguous acked range, so we
+            // can't drop it.
+            if buf.off >= ack_off {
+                break;
+            }
+
+            // Highest contiguous acked range falls within newly acked range,
+            // so we can't drop it.
+            if buf.off < ack_off && ack_off < buf.max_off() {
+                break;
+            }
+
+            // Newly acked range can be dropped.
+            drop_until = Some(i);
+        }
+
+        if let Some(drop) = drop_until {
+            self.data.drain(..=drop);
+
+            // When a buffer is marked for retransmission, but then acked before
+            // it could be retransmitted, we might end up decreasing the SendBuf
+            // position too much, so make sure that doesn't happen.
+            self.pos = self.pos.saturating_sub(drop + 1);
+        }
+    }
+
+    pub fn retransmit(&mut self, off: u64, len: usize) {
+        let max_off = off + len as u64;
+        let ack_off = self.ack_off();
+
+        if self.data.is_empty() {
+            return;
+        }
+
+        if max_off <= ack_off {
+            return;
+        }
+
+        for i in 0..self.data.len() {
+            let buf = &mut self.data[i];
+
+            if buf.off >= max_off {
+                break;
+            }
+
+            if off > buf.max_off() {
+                continue;
+            }
+
+            // Split the buffer into 2 if the retransmit range ends before the
+            // buffer's final offset.
+            let new_buf = if buf.off < max_off && max_off < buf.max_off() {
+                Some(buf.split_off((max_off - buf.off as u64) as usize))
+            } else {
+                None
+            };
+
+            // Advance the buffer's position if the retransmit range is past
+            // the buffer's starting offset.
+            buf.pos = if off > buf.off && off <= buf.max_off() {
+                cmp::min(buf.pos, buf.start + (off - buf.off) as usize)
+            } else {
+                buf.start
+            };
+
+            self.pos = cmp::min(self.pos, i);
+
+            self.len += buf.len() as u64;
+
+            if let Some(b) = new_buf {
+                self.data.insert(i + 1, b);
+            }
+        }
+    }
+
+    /// Resets the stream at the current offset and clears all buffered data.
+    pub fn reset(&mut self) -> Result<u64> {
+        self.write(b"", true)?;
+
+        // Drop all buffered data.
+        self.data.clear();
+
+        // Mark all data as acked.
+        self.ack(0, self.off as usize);
+
+        self.pos = 0;
+        self.len = 0;
+
+        Ok(self.fin_off.unwrap())
+    }
+
+    /// Resets the streams and records the received error code.
+    ///
+    /// Calling this again after the first time has no effect.
+    pub fn stop(&mut self, error_code: u64) -> Result<u64> {
+        if self.error.is_some() {
+            return Err(Error::Done);
+        }
+
+        let fin_off = self.reset()?;
+
+        self.error = Some(error_code);
+
+        Ok(fin_off)
+    }
+
     /// Shuts down sending data.
-    pub fn shutdown(&mut self) -> Result<()> {
+    pub fn shutdown(&mut self) -> Result<u64> {
         if self.shutdown {
             return Err(Error::Done);
         }
 
         self.shutdown = true;
 
-        self.data.clear();
-
-        Ok(())
+        self.reset()
     }
 
     /// Returns the largest offset of data buffered.
@@ -1071,11 +1314,18 @@ impl SendBuf {
 
     /// Returns the lowest offset of data buffered.
     pub fn off_front(&self) -> u64 {
-        match self.data.peek() {
-            Some(v) => v.off(),
+        let mut pos = self.pos;
 
-            None => self.off,
+        // Skip empty buffers from the start of the queue.
+        while let Some(b) = self.data.get(pos) {
+            if !b.is_empty() {
+                return b.off();
+            }
+
+            pos += 1;
         }
+
+        self.off
     }
 
     /// The maximum offset we are allowed to send to the peer.
@@ -1109,9 +1359,14 @@ impl SendBuf {
         false
     }
 
+    /// Returns true if the stream was stopped before completion.
+    pub fn is_stopped(&self) -> bool {
+        self.error.is_some()
+    }
+
     /// Returns true if there is data to be written.
     fn ready(&self) -> bool {
-        !self.data.is_empty()
+        !self.data.is_empty() && self.off_front() < self.off
     }
 
     /// Returns the highest contiguously acked offset.
@@ -1126,22 +1381,54 @@ impl SendBuf {
     }
 
     /// Returns the outgoing flow control capacity.
-    pub fn cap(&self) -> usize {
-        (self.max_data - self.off) as usize
+    pub fn cap(&self) -> Result<usize> {
+        // The stream was stopped, so return the error code instead.
+        if let Some(e) = self.error {
+            return Err(Error::StreamStopped(e));
+        }
+
+        Ok((self.max_data - self.off) as usize)
     }
 }
 
 /// Buffer holding data at a specific offset.
-#[derive(Clone, Debug, Default, Eq)]
+///
+/// The data is stored in a `Vec<u8>` in such a way that it can be shared
+/// between multiple `RangeBuf` objects.
+///
+/// Each `RangeBuf` will have its own view of that buffer, where the `start`
+/// value indicates the initial offset within the `Vec`, and `len` indicates the
+/// number of bytes, starting from `start` that are included.
+///
+/// In addition, `pos` indicates the current offset within the `Vec`, starting
+/// from the very beginning of the `Vec`.
+///
+/// Finally, `off` is the starting offset for the specific `RangeBuf` within the
+/// stream the buffer belongs to.
+#[derive(Clone, Debug, Default)]
 pub struct RangeBuf {
     /// The internal buffer holding the data.
-    data: Vec<u8>,
+    ///
+    /// To avoid neeless allocations when a RangeBuf is split, this field is
+    /// reference-counted and can be shared between multiple RangeBuf objects,
+    /// and sliced using the `start` and `len` values.
+    ///
+    /// In order to allow the inner `Vec` to be mutated, an `RwLock` is used to
+    /// achieve interior mutability (`RefCell` can't be used here because it
+    /// does not implement `Sync`, which is required by `Arc` to make the type
+    /// `Send`-able).
+    data: Arc<RwLock<Vec<u8>>>,
 
-    /// The starting offset within `data`. This allows partially consuming a
-    /// buffer without duplicating the data.
+    /// The initial offset within the internal buffer.
+    start: usize,
+
+    /// The current offset within the internal buffer.
     pos: usize,
 
-    /// The starting offset within a stream.
+    /// The number of bytes in the buffer, from the initial offset.
+    len: usize,
+
+    /// The offset of the buffer within a stream.
     off: u64,
 
     /// Whether this contains the final byte in the stream.
@@ -1150,13 +1437,40 @@ pub struct RangeBuf {
 
 impl RangeBuf {
     /// Creates a new `RangeBuf` from the given slice.
-    pub(crate) fn from(buf: &[u8], off: u64, fin: bool) -> RangeBuf {
+    pub fn from(buf: &[u8], off: u64, fin: bool) -> RangeBuf {
         RangeBuf {
-            data: Vec::from(buf),
+            data: Arc::new(RwLock::new(Vec::from(buf))),
+            start: 0,
             pos: 0,
+            len: buf.len(),
             off,
             fin,
         }
+    }
+
+    /// Creates a new `RangeBuf` from the given slice and capacity.
+    ///
+    /// `cap` bytes are allocated for the underlying data store, regardless of
+    /// the size of the input data. When the data is smaller than the capacity,
+    /// the remaining space can be filled by calling `extend_from_slice()`.
+    pub fn from_with_capacity(
+        buf: &[u8], off: u64, fin: bool, cap: usize,
+    ) -> Result<RangeBuf> {
+        if cap < buf.len() {
+            return Err(Error::BufferTooShort);
+        }
+
+        let mut vec = Vec::with_capacity(SEND_BUFFER_SIZE);
+        vec.extend_from_slice(buf);
+
+        Ok(RangeBuf {
+            data: Arc::new(RwLock::new(vec)),
+            start: 0,
+            pos: 0,
+            len: buf.len(),
+            off,
+            fin,
+        })
     }
 
     /// Returns whether `self` holds the final offset in the stream.
@@ -1166,7 +1480,7 @@ impl RangeBuf {
 
     /// Returns the starting offset of `self`.
     pub fn off(&self) -> u64 {
-        self.off + self.pos as u64
+        (self.off - self.start as u64) + self.pos as u64
     }
 
     /// Returns the final offset of `self`.
@@ -1176,7 +1490,13 @@ impl RangeBuf {
 
     /// Returns the length of `self`.
     pub fn len(&self) -> usize {
-        self.data.len() - self.pos
+        self.len - (self.pos - self.start)
+    }
+
+    /// Returns the amount of bytes that can be written to the internal buffer.
+    pub fn spare_capacity(&self) -> usize {
+        let r = self.data.read().unwrap();
+        r.capacity() - r.len()
     }
 
     /// Returns true if `self` has a length of zero bytes.
@@ -1189,32 +1509,52 @@ impl RangeBuf {
         self.pos += count;
     }
 
+    /// Applies the given function to the internal buffer.
+    pub fn with<F, T>(&self, f: F) -> T
+    where
+        F: FnOnce(&[u8]) -> T,
+    {
+        let r = self.data.read().unwrap();
+        f(&r[self.pos..self.start + self.len])
+    }
+
+    /// Extends the internal buffer with the given slice.
+    pub fn extend_from_slice(&mut self, other: &[u8]) -> Result<()> {
+        if self.spare_capacity() < other.len() {
+            return Err(Error::BufferTooShort);
+        }
+
+        let mut w = self.data.write().unwrap();
+        w.extend_from_slice(other);
+
+        self.len += other.len();
+
+        Ok(())
+    }
+
     /// Splits the buffer into two at the given index.
     pub fn split_off(&mut self, at: usize) -> RangeBuf {
+        if at > self.len {
+            panic!(
+                "`at` split index (is {}) should be <= len (is {})",
+                at, self.len
+            );
+        }
+
         let buf = RangeBuf {
-            data: self.data.split_off(at),
-            pos: 0,
+            data: self.data.clone(),
+            start: self.start + at,
+            pos: cmp::max(self.pos, self.start + at),
+            len: self.len - at,
             off: self.off + at as u64,
             fin: self.fin,
         };
 
+        self.pos = cmp::min(self.pos, self.start + at);
+        self.len = at;
         self.fin = false;
 
         buf
-    }
-}
-
-impl std::ops::Deref for RangeBuf {
-    type Target = [u8];
-
-    fn deref(&self) -> &[u8] {
-        &self.data[self.pos..]
-    }
-}
-
-impl std::ops::DerefMut for RangeBuf {
-    fn deref_mut(&mut self) -> &mut [u8] {
-        &mut self.data[self.pos..]
     }
 }
 
@@ -1237,6 +1577,9 @@ impl PartialEq for RangeBuf {
     }
 }
 
+// Implement Eq explicitly because RwLock prevents it from being derived.
+impl Eq for RangeBuf {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1248,7 +1591,7 @@ mod tests {
 
         let mut buf = [0; 32];
 
-        assert_eq!(recv.pop(&mut buf), Err(Error::Done));
+        assert_eq!(recv.emit(&mut buf), Err(Error::Done));
     }
 
     #[test]
@@ -1257,54 +1600,54 @@ mod tests {
         assert_eq!(recv.len, 0);
 
         let buf = RangeBuf::from(b"hello", 0, false);
-        assert!(recv.push(buf).is_ok());
+        assert!(recv.write(buf).is_ok());
         assert_eq!(recv.len, 5);
         assert_eq!(recv.off, 0);
         assert_eq!(recv.data.len(), 1);
 
         let mut buf = [0; 32];
-        assert_eq!(recv.pop(&mut buf), Ok((5, false)));
+        assert_eq!(recv.emit(&mut buf), Ok((5, false)));
 
         // Don't store non-fin empty buffer.
         let buf = RangeBuf::from(b"", 10, false);
-        assert!(recv.push(buf).is_ok());
+        assert!(recv.write(buf).is_ok());
         assert_eq!(recv.len, 5);
         assert_eq!(recv.off, 5);
         assert_eq!(recv.data.len(), 0);
 
         // Check flow control for empty buffer.
         let buf = RangeBuf::from(b"", 16, false);
-        assert_eq!(recv.push(buf), Err(Error::FlowControl));
+        assert_eq!(recv.write(buf), Err(Error::FlowControl));
 
         // Store fin empty buffer.
         let buf = RangeBuf::from(b"", 5, true);
-        assert!(recv.push(buf).is_ok());
+        assert!(recv.write(buf).is_ok());
         assert_eq!(recv.len, 5);
         assert_eq!(recv.off, 5);
         assert_eq!(recv.data.len(), 1);
 
         // Don't store additional fin empty buffers.
         let buf = RangeBuf::from(b"", 5, true);
-        assert!(recv.push(buf).is_ok());
+        assert!(recv.write(buf).is_ok());
         assert_eq!(recv.len, 5);
         assert_eq!(recv.off, 5);
         assert_eq!(recv.data.len(), 1);
 
         // Don't store additional fin non-empty buffers.
         let buf = RangeBuf::from(b"aa", 3, true);
-        assert!(recv.push(buf).is_ok());
+        assert!(recv.write(buf).is_ok());
         assert_eq!(recv.len, 5);
         assert_eq!(recv.off, 5);
         assert_eq!(recv.data.len(), 1);
 
         // Validate final size with fin empty buffers.
         let buf = RangeBuf::from(b"", 6, true);
-        assert_eq!(recv.push(buf), Err(Error::FinalSize));
+        assert_eq!(recv.write(buf), Err(Error::FinalSize));
         let buf = RangeBuf::from(b"", 4, true);
-        assert_eq!(recv.push(buf), Err(Error::FinalSize));
+        assert_eq!(recv.write(buf), Err(Error::FinalSize));
 
         let mut buf = [0; 32];
-        assert_eq!(recv.pop(&mut buf), Ok((0, true)));
+        assert_eq!(recv.emit(&mut buf), Ok((0, true)));
     }
 
     #[test]
@@ -1318,30 +1661,30 @@ mod tests {
         let second = RangeBuf::from(b"world", 5, false);
         let third = RangeBuf::from(b"something", 10, true);
 
-        assert!(recv.push(second).is_ok());
+        assert!(recv.write(second).is_ok());
         assert_eq!(recv.len, 10);
         assert_eq!(recv.off, 0);
 
-        assert_eq!(recv.pop(&mut buf), Err(Error::Done));
+        assert_eq!(recv.emit(&mut buf), Err(Error::Done));
 
-        assert!(recv.push(third).is_ok());
+        assert!(recv.write(third).is_ok());
         assert_eq!(recv.len, 19);
         assert_eq!(recv.off, 0);
 
-        assert_eq!(recv.pop(&mut buf), Err(Error::Done));
+        assert_eq!(recv.emit(&mut buf), Err(Error::Done));
 
-        assert!(recv.push(first).is_ok());
+        assert!(recv.write(first).is_ok());
         assert_eq!(recv.len, 19);
         assert_eq!(recv.off, 0);
 
-        let (len, fin) = recv.pop(&mut buf).unwrap();
+        let (len, fin) = recv.emit(&mut buf).unwrap();
         assert_eq!(len, 19);
         assert_eq!(fin, true);
         assert_eq!(&buf[..len], b"helloworldsomething");
         assert_eq!(recv.len, 19);
         assert_eq!(recv.off, 19);
 
-        assert_eq!(recv.pop(&mut buf), Err(Error::Done));
+        assert_eq!(recv.emit(&mut buf), Err(Error::Done));
     }
 
     #[test]
@@ -1354,29 +1697,29 @@ mod tests {
         let first = RangeBuf::from(b"something", 0, false);
         let second = RangeBuf::from(b"helloworld", 9, true);
 
-        assert!(recv.push(first).is_ok());
+        assert!(recv.write(first).is_ok());
         assert_eq!(recv.len, 9);
         assert_eq!(recv.off, 0);
 
-        assert!(recv.push(second).is_ok());
+        assert!(recv.write(second).is_ok());
         assert_eq!(recv.len, 19);
         assert_eq!(recv.off, 0);
 
-        let (len, fin) = recv.pop(&mut buf[..10]).unwrap();
+        let (len, fin) = recv.emit(&mut buf[..10]).unwrap();
         assert_eq!(len, 10);
         assert_eq!(fin, false);
         assert_eq!(&buf[..len], b"somethingh");
         assert_eq!(recv.len, 19);
         assert_eq!(recv.off, 10);
 
-        let (len, fin) = recv.pop(&mut buf[..5]).unwrap();
+        let (len, fin) = recv.emit(&mut buf[..5]).unwrap();
         assert_eq!(len, 5);
         assert_eq!(fin, false);
         assert_eq!(&buf[..len], b"ellow");
         assert_eq!(recv.len, 19);
         assert_eq!(recv.off, 15);
 
-        let (len, fin) = recv.pop(&mut buf[..10]).unwrap();
+        let (len, fin) = recv.emit(&mut buf[..10]).unwrap();
         assert_eq!(len, 4);
         assert_eq!(fin, true);
         assert_eq!(&buf[..len], b"orld");
@@ -1394,17 +1737,17 @@ mod tests {
         let first = RangeBuf::from(b"something", 0, false);
         let second = RangeBuf::from(b"helloworld", 9, true);
 
-        assert!(recv.push(second).is_ok());
+        assert!(recv.write(second).is_ok());
         assert_eq!(recv.len, 19);
         assert_eq!(recv.off, 0);
 
-        assert_eq!(recv.pop(&mut buf), Err(Error::Done));
+        assert_eq!(recv.emit(&mut buf), Err(Error::Done));
 
-        assert!(recv.push(first).is_ok());
+        assert!(recv.write(first).is_ok());
         assert_eq!(recv.len, 19);
         assert_eq!(recv.off, 0);
 
-        let (len, fin) = recv.pop(&mut buf).unwrap();
+        let (len, fin) = recv.emit(&mut buf).unwrap();
         assert_eq!(len, 19);
         assert_eq!(fin, true);
         assert_eq!(&buf[..len], b"somethinghelloworld");
@@ -1422,17 +1765,17 @@ mod tests {
         let first = RangeBuf::from(b"something", 0, false);
         let second = RangeBuf::from(b"", 9, true);
 
-        assert!(recv.push(first).is_ok());
+        assert!(recv.write(first).is_ok());
         assert_eq!(recv.len, 9);
         assert_eq!(recv.off, 0);
         assert_eq!(recv.data.len(), 1);
 
-        assert!(recv.push(second).is_ok());
+        assert!(recv.write(second).is_ok());
         assert_eq!(recv.len, 9);
         assert_eq!(recv.off, 0);
         assert_eq!(recv.data.len(), 1);
 
-        let (len, fin) = recv.pop(&mut buf).unwrap();
+        let (len, fin) = recv.emit(&mut buf).unwrap();
         assert_eq!(len, 9);
         assert_eq!(fin, true);
         assert_eq!(&buf[..len], b"something");
@@ -1452,31 +1795,31 @@ mod tests {
         let third = RangeBuf::from(b"ello", 4, true);
         let fourth = RangeBuf::from(b"ello", 5, true);
 
-        assert!(recv.push(first).is_ok());
+        assert!(recv.write(first).is_ok());
         assert_eq!(recv.len, 9);
         assert_eq!(recv.off, 0);
         assert_eq!(recv.data.len(), 1);
 
-        let (len, fin) = recv.pop(&mut buf).unwrap();
+        let (len, fin) = recv.emit(&mut buf).unwrap();
         assert_eq!(len, 9);
         assert_eq!(fin, false);
         assert_eq!(&buf[..len], b"something");
         assert_eq!(recv.len, 9);
         assert_eq!(recv.off, 9);
 
-        assert!(recv.push(second).is_ok());
+        assert!(recv.write(second).is_ok());
         assert_eq!(recv.len, 9);
         assert_eq!(recv.off, 9);
         assert_eq!(recv.data.len(), 0);
 
-        assert_eq!(recv.push(third), Err(Error::FinalSize));
+        assert_eq!(recv.write(third), Err(Error::FinalSize));
 
-        assert!(recv.push(fourth).is_ok());
+        assert!(recv.write(fourth).is_ok());
         assert_eq!(recv.len, 9);
         assert_eq!(recv.off, 9);
         assert_eq!(recv.data.len(), 0);
 
-        assert_eq!(recv.pop(&mut buf), Err(Error::Done));
+        assert_eq!(recv.emit(&mut buf), Err(Error::Done));
     }
 
     #[test]
@@ -1489,17 +1832,17 @@ mod tests {
         let first = RangeBuf::from(b"something", 0, false);
         let second = RangeBuf::from(b"hello", 4, false);
 
-        assert!(recv.push(first).is_ok());
+        assert!(recv.write(first).is_ok());
         assert_eq!(recv.len, 9);
         assert_eq!(recv.off, 0);
         assert_eq!(recv.data.len(), 1);
 
-        assert!(recv.push(second).is_ok());
+        assert!(recv.write(second).is_ok());
         assert_eq!(recv.len, 9);
         assert_eq!(recv.off, 0);
         assert_eq!(recv.data.len(), 1);
 
-        let (len, fin) = recv.pop(&mut buf).unwrap();
+        let (len, fin) = recv.emit(&mut buf).unwrap();
         assert_eq!(len, 9);
         assert_eq!(fin, false);
         assert_eq!(&buf[..len], b"something");
@@ -1507,7 +1850,7 @@ mod tests {
         assert_eq!(recv.off, 9);
         assert_eq!(recv.data.len(), 0);
 
-        assert_eq!(recv.pop(&mut buf), Err(Error::Done));
+        assert_eq!(recv.emit(&mut buf), Err(Error::Done));
     }
 
     #[test]
@@ -1520,17 +1863,17 @@ mod tests {
         let first = RangeBuf::from(b"something", 0, false);
         let second = RangeBuf::from(b"hello", 4, false);
 
-        assert!(recv.push(second).is_ok());
+        assert!(recv.write(second).is_ok());
         assert_eq!(recv.len, 9);
         assert_eq!(recv.off, 0);
         assert_eq!(recv.data.len(), 1);
 
-        assert!(recv.push(first).is_ok());
+        assert!(recv.write(first).is_ok());
         assert_eq!(recv.len, 9);
         assert_eq!(recv.off, 0);
         assert_eq!(recv.data.len(), 2);
 
-        let (len, fin) = recv.pop(&mut buf).unwrap();
+        let (len, fin) = recv.emit(&mut buf).unwrap();
         assert_eq!(len, 9);
         assert_eq!(fin, false);
         assert_eq!(&buf[..len], b"somehello");
@@ -1538,7 +1881,7 @@ mod tests {
         assert_eq!(recv.off, 9);
         assert_eq!(recv.data.len(), 0);
 
-        assert_eq!(recv.pop(&mut buf), Err(Error::Done));
+        assert_eq!(recv.emit(&mut buf), Err(Error::Done));
     }
 
     #[test]
@@ -1551,17 +1894,17 @@ mod tests {
         let first = RangeBuf::from(b"something", 0, false);
         let second = RangeBuf::from(b"hello", 3, false);
 
-        assert!(recv.push(second).is_ok());
+        assert!(recv.write(second).is_ok());
         assert_eq!(recv.len, 8);
         assert_eq!(recv.off, 0);
         assert_eq!(recv.data.len(), 1);
 
-        assert!(recv.push(first).is_ok());
+        assert!(recv.write(first).is_ok());
         assert_eq!(recv.len, 9);
         assert_eq!(recv.off, 0);
         assert_eq!(recv.data.len(), 3);
 
-        let (len, fin) = recv.pop(&mut buf).unwrap();
+        let (len, fin) = recv.emit(&mut buf).unwrap();
         assert_eq!(len, 9);
         assert_eq!(fin, false);
         assert_eq!(&buf[..len], b"somhellog");
@@ -1569,7 +1912,7 @@ mod tests {
         assert_eq!(recv.off, 9);
         assert_eq!(recv.data.len(), 0);
 
-        assert_eq!(recv.pop(&mut buf), Err(Error::Done));
+        assert_eq!(recv.emit(&mut buf), Err(Error::Done));
     }
 
     #[test]
@@ -1583,22 +1926,22 @@ mod tests {
         let second = RangeBuf::from(b"hello", 3, false);
         let third = RangeBuf::from(b"hello", 12, false);
 
-        assert!(recv.push(second).is_ok());
+        assert!(recv.write(second).is_ok());
         assert_eq!(recv.len, 8);
         assert_eq!(recv.off, 0);
         assert_eq!(recv.data.len(), 1);
 
-        assert!(recv.push(third).is_ok());
+        assert!(recv.write(third).is_ok());
         assert_eq!(recv.len, 17);
         assert_eq!(recv.off, 0);
         assert_eq!(recv.data.len(), 2);
 
-        assert!(recv.push(first).is_ok());
+        assert!(recv.write(first).is_ok());
         assert_eq!(recv.len, 18);
         assert_eq!(recv.off, 0);
         assert_eq!(recv.data.len(), 5);
 
-        let (len, fin) = recv.pop(&mut buf).unwrap();
+        let (len, fin) = recv.emit(&mut buf).unwrap();
         assert_eq!(len, 18);
         assert_eq!(fin, false);
         assert_eq!(&buf[..len], b"somhellogsomhellog");
@@ -1606,7 +1949,7 @@ mod tests {
         assert_eq!(recv.off, 18);
         assert_eq!(recv.data.len(), 0);
 
-        assert_eq!(recv.pop(&mut buf), Err(Error::Done));
+        assert_eq!(recv.emit(&mut buf), Err(Error::Done));
     }
 
     #[test]
@@ -1619,24 +1962,24 @@ mod tests {
         let first = RangeBuf::from(b"something", 0, false);
         let second = RangeBuf::from(b"hello", 8, true);
 
-        assert!(recv.push(first).is_ok());
+        assert!(recv.write(first).is_ok());
         assert_eq!(recv.len, 9);
         assert_eq!(recv.off, 0);
         assert_eq!(recv.data.len(), 1);
 
-        assert!(recv.push(second).is_ok());
+        assert!(recv.write(second).is_ok());
         assert_eq!(recv.len, 13);
         assert_eq!(recv.off, 0);
         assert_eq!(recv.data.len(), 2);
 
-        let (len, fin) = recv.pop(&mut buf).unwrap();
+        let (len, fin) = recv.emit(&mut buf).unwrap();
         assert_eq!(len, 13);
         assert_eq!(fin, true);
         assert_eq!(&buf[..len], b"somethingello");
         assert_eq!(recv.len, 13);
         assert_eq!(recv.off, 13);
 
-        assert_eq!(recv.pop(&mut buf), Err(Error::Done));
+        assert_eq!(recv.emit(&mut buf), Err(Error::Done));
     }
 
     #[test]
@@ -1649,24 +1992,24 @@ mod tests {
         let first = RangeBuf::from(b"hello", 0, false);
         let second = RangeBuf::from(b"something", 3, true);
 
-        assert!(recv.push(second).is_ok());
+        assert!(recv.write(second).is_ok());
         assert_eq!(recv.len, 12);
         assert_eq!(recv.off, 0);
         assert_eq!(recv.data.len(), 1);
 
-        assert!(recv.push(first).is_ok());
+        assert!(recv.write(first).is_ok());
         assert_eq!(recv.len, 12);
         assert_eq!(recv.off, 0);
         assert_eq!(recv.data.len(), 2);
 
-        let (len, fin) = recv.pop(&mut buf).unwrap();
+        let (len, fin) = recv.emit(&mut buf).unwrap();
         assert_eq!(len, 12);
         assert_eq!(fin, true);
         assert_eq!(&buf[..len], b"helsomething");
         assert_eq!(recv.len, 12);
         assert_eq!(recv.off, 12);
 
-        assert_eq!(recv.pop(&mut buf), Err(Error::Done));
+        assert_eq!(recv.emit(&mut buf), Err(Error::Done));
     }
 
     #[test]
@@ -1680,22 +2023,22 @@ mod tests {
         let second = RangeBuf::from(b"something", 0, false);
         let third = RangeBuf::from(b"moar", 11, true);
 
-        assert!(recv.push(first).is_ok());
+        assert!(recv.write(first).is_ok());
         assert_eq!(recv.len, 13);
         assert_eq!(recv.off, 0);
         assert_eq!(recv.data.len(), 1);
 
-        assert!(recv.push(second).is_ok());
+        assert!(recv.write(second).is_ok());
         assert_eq!(recv.len, 13);
         assert_eq!(recv.off, 0);
         assert_eq!(recv.data.len(), 2);
 
-        assert!(recv.push(third).is_ok());
+        assert!(recv.write(third).is_ok());
         assert_eq!(recv.len, 15);
         assert_eq!(recv.off, 0);
         assert_eq!(recv.data.len(), 3);
 
-        let (len, fin) = recv.pop(&mut buf).unwrap();
+        let (len, fin) = recv.emit(&mut buf).unwrap();
         assert_eq!(len, 15);
         assert_eq!(fin, true);
         assert_eq!(&buf[..len], b"somethinhelloar");
@@ -1703,7 +2046,7 @@ mod tests {
         assert_eq!(recv.off, 15);
         assert_eq!(recv.data.len(), 0);
 
-        assert_eq!(recv.pop(&mut buf), Err(Error::Done));
+        assert_eq!(recv.emit(&mut buf), Err(Error::Done));
     }
 
     #[test]
@@ -1720,37 +2063,37 @@ mod tests {
         let fifth = RangeBuf::from(b"eee", 9, false);
         let sixth = RangeBuf::from(b"fff", 11, false);
 
-        assert!(recv.push(second).is_ok());
+        assert!(recv.write(second).is_ok());
         assert_eq!(recv.len, 5);
         assert_eq!(recv.off, 0);
         assert_eq!(recv.data.len(), 1);
 
-        assert!(recv.push(fourth).is_ok());
+        assert!(recv.write(fourth).is_ok());
         assert_eq!(recv.len, 9);
         assert_eq!(recv.off, 0);
         assert_eq!(recv.data.len(), 2);
 
-        assert!(recv.push(third).is_ok());
+        assert!(recv.write(third).is_ok());
         assert_eq!(recv.len, 9);
         assert_eq!(recv.off, 0);
         assert_eq!(recv.data.len(), 3);
 
-        assert!(recv.push(first).is_ok());
+        assert!(recv.write(first).is_ok());
         assert_eq!(recv.len, 9);
         assert_eq!(recv.off, 0);
         assert_eq!(recv.data.len(), 4);
 
-        assert!(recv.push(sixth).is_ok());
+        assert!(recv.write(sixth).is_ok());
         assert_eq!(recv.len, 14);
         assert_eq!(recv.off, 0);
         assert_eq!(recv.data.len(), 5);
 
-        assert!(recv.push(fifth).is_ok());
+        assert!(recv.write(fifth).is_ok());
         assert_eq!(recv.len, 14);
         assert_eq!(recv.off, 0);
         assert_eq!(recv.data.len(), 6);
 
-        let (len, fin) = recv.pop(&mut buf).unwrap();
+        let (len, fin) = recv.emit(&mut buf).unwrap();
         assert_eq!(len, 14);
         assert_eq!(fin, false);
         assert_eq!(&buf[..len], b"aabbbcdddeefff");
@@ -1758,78 +2101,91 @@ mod tests {
         assert_eq!(recv.off, 14);
         assert_eq!(recv.data.len(), 0);
 
-        assert_eq!(recv.pop(&mut buf), Err(Error::Done));
+        assert_eq!(recv.emit(&mut buf), Err(Error::Done));
     }
 
     #[test]
     fn empty_write() {
+        let mut buf = [0; 5];
+
         let mut send = SendBuf::new(std::u64::MAX);
         assert_eq!(send.len, 0);
 
-        let write = send.pop(std::usize::MAX).unwrap();
-        assert_eq!(write.len(), 0);
-        assert_eq!(write.fin(), false);
+        let (written, fin) = send.emit(&mut buf).unwrap();
+        assert_eq!(written, 0);
+        assert_eq!(fin, false);
     }
 
     #[test]
     fn multi_write() {
+        let mut buf = [0; 128];
+
         let mut send = SendBuf::new(std::u64::MAX);
         assert_eq!(send.len, 0);
 
         let first = b"something";
         let second = b"helloworld";
 
-        assert!(send.push_slice(first, false).is_ok());
+        assert!(send.write(first, false).is_ok());
         assert_eq!(send.len, 9);
 
-        assert!(send.push_slice(second, true).is_ok());
+        assert!(send.write(second, true).is_ok());
         assert_eq!(send.len, 19);
 
-        let write = send.pop(128).unwrap();
-        assert_eq!(write.len(), 19);
-        assert_eq!(write.fin(), true);
-        assert_eq!(&write[..], b"somethinghelloworld");
+        let (written, fin) = send.emit(&mut buf[..128]).unwrap();
+        assert_eq!(written, 19);
+        assert_eq!(fin, true);
+        assert_eq!(&buf[..written], b"somethinghelloworld");
         assert_eq!(send.len, 0);
     }
 
     #[test]
     fn split_write() {
+        let mut buf = [0; 10];
+
         let mut send = SendBuf::new(std::u64::MAX);
         assert_eq!(send.len, 0);
 
         let first = b"something";
         let second = b"helloworld";
 
-        assert!(send.push_slice(first, false).is_ok());
+        assert!(send.write(first, false).is_ok());
         assert_eq!(send.len, 9);
 
-        assert!(send.push_slice(second, true).is_ok());
+        assert!(send.write(second, true).is_ok());
         assert_eq!(send.len, 19);
 
-        let write = send.pop(10).unwrap();
-        assert_eq!(write.off(), 0);
-        assert_eq!(write.len(), 10);
-        assert_eq!(write.fin(), false);
-        assert_eq!(&write[..], b"somethingh");
+        assert_eq!(send.off_front(), 0);
+
+        let (written, fin) = send.emit(&mut buf[..10]).unwrap();
+        assert_eq!(written, 10);
+        assert_eq!(fin, false);
+        assert_eq!(&buf[..written], b"somethingh");
         assert_eq!(send.len, 9);
 
-        let write = send.pop(5).unwrap();
-        assert_eq!(write.off(), 10);
-        assert_eq!(write.len(), 5);
-        assert_eq!(write.fin(), false);
-        assert_eq!(&write[..], b"ellow");
+        assert_eq!(send.off_front(), 10);
+
+        let (written, fin) = send.emit(&mut buf[..5]).unwrap();
+        assert_eq!(written, 5);
+        assert_eq!(fin, false);
+        assert_eq!(&buf[..written], b"ellow");
         assert_eq!(send.len, 4);
 
-        let write = send.pop(10).unwrap();
-        assert_eq!(write.off(), 15);
-        assert_eq!(write.len(), 4);
-        assert_eq!(write.fin(), true);
-        assert_eq!(&write[..], b"orld");
+        assert_eq!(send.off_front(), 15);
+
+        let (written, fin) = send.emit(&mut buf[..10]).unwrap();
+        assert_eq!(written, 4);
+        assert_eq!(fin, true);
+        assert_eq!(&buf[..written], b"orld");
         assert_eq!(send.len, 0);
+
+        assert_eq!(send.off_front(), 19);
     }
 
     #[test]
     fn resend() {
+        let mut buf = [0; 15];
+
         let mut send = SendBuf::new(std::u64::MAX);
         assert_eq!(send.len, 0);
         assert_eq!(send.off_front(), 0);
@@ -1837,143 +2193,149 @@ mod tests {
         let first = b"something";
         let second = b"helloworld";
 
-        assert!(send.push_slice(first, false).is_ok());
+        assert!(send.write(first, false).is_ok());
         assert_eq!(send.off_front(), 0);
 
-        assert!(send.push_slice(second, true).is_ok());
+        assert!(send.write(second, true).is_ok());
         assert_eq!(send.off_front(), 0);
 
-        let write1 = send.pop(4).unwrap();
-        assert_eq!(write1.off(), 0);
-        assert_eq!(write1.len(), 4);
-        assert_eq!(write1.fin(), false);
-        assert_eq!(&write1[..], b"some");
+        assert_eq!(send.len, 19);
+
+        let (written, fin) = send.emit(&mut buf[..4]).unwrap();
+        assert_eq!(written, 4);
+        assert_eq!(fin, false);
+        assert_eq!(&buf[..written], b"some");
         assert_eq!(send.len, 15);
         assert_eq!(send.off_front(), 4);
 
-        let write2 = send.pop(5).unwrap();
-        assert_eq!(write2.off(), 4);
-        assert_eq!(write2.len(), 5);
-        assert_eq!(write2.fin(), false);
-        assert_eq!(&write2[..], b"thing");
+        let (written, fin) = send.emit(&mut buf[..5]).unwrap();
+        assert_eq!(written, 5);
+        assert_eq!(fin, false);
+        assert_eq!(&buf[..written], b"thing");
         assert_eq!(send.len, 10);
         assert_eq!(send.off_front(), 9);
 
-        let write3 = send.pop(5).unwrap();
-        assert_eq!(write3.off(), 9);
-        assert_eq!(write3.len(), 5);
-        assert_eq!(write3.fin(), false);
-        assert_eq!(&write3[..], b"hello");
+        let (written, fin) = send.emit(&mut buf[..5]).unwrap();
+        assert_eq!(written, 5);
+        assert_eq!(fin, false);
+        assert_eq!(&buf[..written], b"hello");
         assert_eq!(send.len, 5);
         assert_eq!(send.off_front(), 14);
 
-        send.push(write2).unwrap();
+        send.retransmit(4, 5);
         assert_eq!(send.len, 10);
         assert_eq!(send.off_front(), 4);
 
-        send.push(write1).unwrap();
+        send.retransmit(0, 4);
         assert_eq!(send.len, 14);
         assert_eq!(send.off_front(), 0);
 
-        let write4 = send.pop(11).unwrap();
-        assert_eq!(write4.off(), 0);
-        assert_eq!(write4.len(), 9);
-        assert_eq!(write4.fin(), false);
-        assert_eq!(&write4[..], b"something");
+        let (written, fin) = send.emit(&mut buf[..11]).unwrap();
+        assert_eq!(written, 9);
+        assert_eq!(fin, false);
+        assert_eq!(&buf[..written], b"something");
         assert_eq!(send.len, 5);
         assert_eq!(send.off_front(), 14);
 
-        let write5 = send.pop(11).unwrap();
-        assert_eq!(write5.off(), 14);
-        assert_eq!(write5.len(), 5);
-        assert_eq!(write5.fin(), true);
-        assert_eq!(&write5[..], b"world");
+        let (written, fin) = send.emit(&mut buf[..11]).unwrap();
+        assert_eq!(written, 5);
+        assert_eq!(fin, true);
+        assert_eq!(&buf[..written], b"world");
         assert_eq!(send.len, 0);
         assert_eq!(send.off_front(), 19);
     }
 
     #[test]
     fn write_blocked_by_off() {
+        let mut buf = [0; 10];
+
         let mut send = SendBuf::default();
         assert_eq!(send.len, 0);
 
         let first = b"something";
         let second = b"helloworld";
 
-        assert_eq!(send.push_slice(first, false), Ok(0));
+        assert_eq!(send.write(first, false), Ok(0));
         assert_eq!(send.len, 0);
 
-        assert_eq!(send.push_slice(second, true), Ok(0));
+        assert_eq!(send.write(second, true), Ok(0));
         assert_eq!(send.len, 0);
 
         send.update_max_data(5);
 
-        assert_eq!(send.push_slice(first, false), Ok(5));
+        assert_eq!(send.write(first, false), Ok(5));
         assert_eq!(send.len, 5);
 
-        assert_eq!(send.push_slice(second, true), Ok(0));
+        assert_eq!(send.write(second, true), Ok(0));
         assert_eq!(send.len, 5);
 
-        let write = send.pop(10).unwrap();
-        assert_eq!(write.off(), 0);
-        assert_eq!(write.len(), 5);
-        assert_eq!(write.fin(), false);
-        assert_eq!(&write[..], b"somet");
+        assert_eq!(send.off_front(), 0);
+
+        let (written, fin) = send.emit(&mut buf[..10]).unwrap();
+        assert_eq!(written, 5);
+        assert_eq!(fin, false);
+        assert_eq!(&buf[..written], b"somet");
         assert_eq!(send.len, 0);
 
-        let write = send.pop(10).unwrap();
-        assert_eq!(write.off(), 5);
-        assert_eq!(write.len(), 0);
-        assert_eq!(write.fin(), false);
-        assert_eq!(&write[..], b"");
+        assert_eq!(send.off_front(), 5);
+
+        let (written, fin) = send.emit(&mut buf[..10]).unwrap();
+        assert_eq!(written, 0);
+        assert_eq!(fin, false);
+        assert_eq!(&buf[..written], b"");
         assert_eq!(send.len, 0);
 
         send.update_max_data(15);
 
-        assert_eq!(send.push_slice(&first[5..], false), Ok(4));
+        assert_eq!(send.write(&first[5..], false), Ok(4));
         assert_eq!(send.len, 4);
 
-        assert_eq!(send.push_slice(second, true), Ok(6));
+        assert_eq!(send.write(second, true), Ok(6));
         assert_eq!(send.len, 10);
 
-        let write = send.pop(10).unwrap();
-        assert_eq!(write.off(), 5);
-        assert_eq!(write.len(), 10);
-        assert_eq!(write.fin(), false);
-        assert_eq!(&write[..], b"hinghellow");
+        assert_eq!(send.off_front(), 5);
+
+        let (written, fin) = send.emit(&mut buf[..10]).unwrap();
+        assert_eq!(written, 10);
+        assert_eq!(fin, false);
+        assert_eq!(&buf[..10], b"hinghellow");
         assert_eq!(send.len, 0);
 
         send.update_max_data(25);
 
-        assert_eq!(send.push_slice(&second[6..], true), Ok(4));
+        assert_eq!(send.write(&second[6..], true), Ok(4));
         assert_eq!(send.len, 4);
 
-        let write = send.pop(10).unwrap();
-        assert_eq!(write.off(), 15);
-        assert_eq!(write.len(), 4);
-        assert_eq!(write.fin(), true);
-        assert_eq!(&write[..], b"orld");
+        assert_eq!(send.off_front(), 15);
+
+        let (written, fin) = send.emit(&mut buf[..10]).unwrap();
+        assert_eq!(written, 4);
+        assert_eq!(fin, true);
+        assert_eq!(&buf[..written], b"orld");
         assert_eq!(send.len, 0);
     }
 
     #[test]
     fn zero_len_write() {
+        let mut buf = [0; 10];
+
         let mut send = SendBuf::new(std::u64::MAX);
         assert_eq!(send.len, 0);
 
         let first = b"something";
 
-        assert!(send.push_slice(first, false).is_ok());
+        assert!(send.write(first, false).is_ok());
         assert_eq!(send.len, 9);
 
-        assert!(send.push_slice(&[], true).is_ok());
+        assert!(send.write(&[], true).is_ok());
         assert_eq!(send.len, 9);
 
-        let write = send.pop(10).unwrap();
-        assert_eq!(write.off(), 0);
-        assert_eq!(write.len(), 9);
-        assert_eq!(write.fin(), true);
-        assert_eq!(&write[..], b"something");
+        assert_eq!(send.off_front(), 0);
+
+        let (written, fin) = send.emit(&mut buf[..10]).unwrap();
+        assert_eq!(written, 9);
+        assert_eq!(fin, true);
+        assert_eq!(&buf[..written], b"something");
         assert_eq!(send.len, 0);
     }
 
@@ -1988,13 +2350,13 @@ mod tests {
         let second = RangeBuf::from(b"world", 5, false);
         let third = RangeBuf::from(b"something", 10, false);
 
-        assert_eq!(stream.recv.push(second), Ok(()));
-        assert_eq!(stream.recv.push(first), Ok(()));
+        assert_eq!(stream.recv.write(second), Ok(()));
+        assert_eq!(stream.recv.write(first), Ok(()));
         assert!(!stream.recv.almost_full());
 
-        assert_eq!(stream.recv.push(third), Err(Error::FlowControl));
+        assert_eq!(stream.recv.write(third), Err(Error::FlowControl));
 
-        let (len, fin) = stream.recv.pop(&mut buf).unwrap();
+        let (len, fin) = stream.recv.emit(&mut buf).unwrap();
         assert_eq!(&buf[..len], b"helloworld");
         assert_eq!(fin, false);
 
@@ -2005,7 +2367,7 @@ mod tests {
         assert!(!stream.recv.almost_full());
 
         let third = RangeBuf::from(b"something", 10, false);
-        assert_eq!(stream.recv.push(third), Ok(()));
+        assert_eq!(stream.recv.write(third), Ok(()));
     }
 
     #[test]
@@ -2016,8 +2378,8 @@ mod tests {
         let first = RangeBuf::from(b"hello", 0, true);
         let second = RangeBuf::from(b"world", 5, false);
 
-        assert_eq!(stream.recv.push(first), Ok(()));
-        assert_eq!(stream.recv.push(second), Err(Error::FinalSize));
+        assert_eq!(stream.recv.write(first), Ok(()));
+        assert_eq!(stream.recv.write(second), Err(Error::FinalSize));
     }
 
     #[test]
@@ -2028,12 +2390,12 @@ mod tests {
         let first = RangeBuf::from(b"hello", 0, true);
         let second = RangeBuf::from(b"hello", 0, true);
 
-        assert_eq!(stream.recv.push(first), Ok(()));
-        assert_eq!(stream.recv.push(second), Ok(()));
+        assert_eq!(stream.recv.write(first), Ok(()));
+        assert_eq!(stream.recv.write(second), Ok(()));
 
         let mut buf = [0; 32];
 
-        let (len, fin) = stream.recv.pop(&mut buf).unwrap();
+        let (len, fin) = stream.recv.emit(&mut buf).unwrap();
         assert_eq!(&buf[..len], b"hello");
         assert_eq!(fin, true);
     }
@@ -2046,8 +2408,8 @@ mod tests {
         let first = RangeBuf::from(b"hello", 0, true);
         let second = RangeBuf::from(b"world", 5, true);
 
-        assert_eq!(stream.recv.push(second), Ok(()));
-        assert_eq!(stream.recv.push(first), Err(Error::FinalSize));
+        assert_eq!(stream.recv.write(second), Ok(()));
+        assert_eq!(stream.recv.write(first), Err(Error::FinalSize));
     }
 
     #[test]
@@ -2058,8 +2420,8 @@ mod tests {
         let first = RangeBuf::from(b"hello", 0, true);
         let second = RangeBuf::from(b"world", 5, false);
 
-        assert_eq!(stream.recv.push(second), Ok(()));
-        assert_eq!(stream.recv.push(first), Err(Error::FinalSize));
+        assert_eq!(stream.recv.write(second), Ok(()));
+        assert_eq!(stream.recv.write(first), Err(Error::FinalSize));
     }
 
     #[test]
@@ -2072,10 +2434,10 @@ mod tests {
         let first = RangeBuf::from(b"hello", 0, false);
         let second = RangeBuf::from(b"world", 5, true);
 
-        assert_eq!(stream.recv.push(first), Ok(()));
-        assert_eq!(stream.recv.push(second), Ok(()));
+        assert_eq!(stream.recv.write(first), Ok(()));
+        assert_eq!(stream.recv.write(second), Ok(()));
 
-        let (len, fin) = stream.recv.pop(&mut buf).unwrap();
+        let (len, fin) = stream.recv.emit(&mut buf).unwrap();
         assert_eq!(&buf[..len], b"helloworld");
         assert_eq!(fin, true);
 
@@ -2089,7 +2451,7 @@ mod tests {
 
         let first = RangeBuf::from(b"hello", 0, true);
 
-        assert_eq!(stream.recv.push(first), Ok(()));
+        assert_eq!(stream.recv.write(first), Ok(()));
         assert_eq!(stream.recv.reset(10), Err(Error::FinalSize));
     }
 
@@ -2100,7 +2462,7 @@ mod tests {
 
         let first = RangeBuf::from(b"hello", 0, false);
 
-        assert_eq!(stream.recv.push(first), Ok(()));
+        assert_eq!(stream.recv.write(first), Ok(()));
         assert_eq!(stream.recv.reset(5), Ok(0));
         assert_eq!(stream.recv.reset(5), Ok(0));
     }
@@ -2112,7 +2474,7 @@ mod tests {
 
         let first = RangeBuf::from(b"hello", 0, false);
 
-        assert_eq!(stream.recv.push(first), Ok(()));
+        assert_eq!(stream.recv.write(first), Ok(()));
         assert_eq!(stream.recv.reset(5), Ok(0));
         assert_eq!(stream.recv.reset(10), Err(Error::FinalSize));
     }
@@ -2124,48 +2486,53 @@ mod tests {
 
         let first = RangeBuf::from(b"hello", 0, false);
 
-        assert_eq!(stream.recv.push(first), Ok(()));
+        assert_eq!(stream.recv.write(first), Ok(()));
         assert_eq!(stream.recv.reset(4), Err(Error::FinalSize));
     }
 
     #[test]
     fn send_flow_control() {
+        let mut buf = [0; 25];
+
         let mut stream = Stream::new(0, 15, true, true);
 
         let first = b"hello";
         let second = b"world";
         let third = b"something";
 
-        assert!(stream.send.push_slice(first, false).is_ok());
-        assert!(stream.send.push_slice(second, false).is_ok());
-        assert!(stream.send.push_slice(third, false).is_ok());
+        assert!(stream.send.write(first, false).is_ok());
+        assert!(stream.send.write(second, false).is_ok());
+        assert!(stream.send.write(third, false).is_ok());
 
-        let write = stream.send.pop(25).unwrap();
-        assert_eq!(write.off(), 0);
-        assert_eq!(write.len(), 15);
-        assert_eq!(write.fin(), false);
-        assert_eq!(write.data, b"helloworldsomet");
+        assert_eq!(stream.send.off_front(), 0);
 
-        let write = stream.send.pop(25).unwrap();
-        assert_eq!(write.off(), 15);
-        assert_eq!(write.len(), 0);
-        assert_eq!(write.fin(), false);
-        assert_eq!(write.data, b"");
+        let (written, fin) = stream.send.emit(&mut buf[..25]).unwrap();
+        assert_eq!(written, 15);
+        assert_eq!(fin, false);
+        assert_eq!(&buf[..written], b"helloworldsomet");
 
-        let first = RangeBuf::from(b"helloworldsomet", 0, false);
-        assert_eq!(stream.send.push(first), Ok(()));
+        assert_eq!(stream.send.off_front(), 15);
 
-        let write = stream.send.pop(10).unwrap();
-        assert_eq!(write.off(), 0);
-        assert_eq!(write.len(), 10);
-        assert_eq!(write.fin(), false);
-        assert_eq!(write.data, b"helloworld");
+        let (written, fin) = stream.send.emit(&mut buf[..25]).unwrap();
+        assert_eq!(written, 0);
+        assert_eq!(fin, false);
+        assert_eq!(&buf[..written], b"");
 
-        let write = stream.send.pop(10).unwrap();
-        assert_eq!(write.off(), 10);
-        assert_eq!(write.len(), 5);
-        assert_eq!(write.fin(), false);
-        assert_eq!(write.data, b"somet");
+        stream.send.retransmit(0, 15);
+
+        assert_eq!(stream.send.off_front(), 0);
+
+        let (written, fin) = stream.send.emit(&mut buf[..10]).unwrap();
+        assert_eq!(written, 10);
+        assert_eq!(fin, false);
+        assert_eq!(&buf[..written], b"helloworld");
+
+        assert_eq!(stream.send.off_front(), 10);
+
+        let (written, fin) = stream.send.emit(&mut buf[..10]).unwrap();
+        assert_eq!(written, 5);
+        assert_eq!(fin, false);
+        assert_eq!(&buf[..written], b"somet");
     }
 
     #[test]
@@ -2176,126 +2543,137 @@ mod tests {
         let second = b"world";
         let third = b"third";
 
-        assert_eq!(stream.send.push_slice(first, false), Ok(5));
+        assert_eq!(stream.send.write(first, false), Ok(5));
 
-        assert_eq!(stream.send.push_slice(second, true), Ok(5));
+        assert_eq!(stream.send.write(second, true), Ok(5));
         assert!(stream.send.is_fin());
 
-        assert_eq!(stream.send.push_slice(third, false), Err(Error::FinalSize));
+        assert_eq!(stream.send.write(third, false), Err(Error::FinalSize));
     }
 
     #[test]
     fn send_fin_dup() {
         let mut stream = Stream::new(0, 15, true, true);
 
-        let first = RangeBuf::from(b"hello", 0, true);
-        let second = RangeBuf::from(b"hello", 0, true);
+        assert_eq!(stream.send.write(b"hello", true), Ok(5));
+        assert!(stream.send.is_fin());
 
-        assert_eq!(stream.send.push(first), Ok(()));
-        assert_eq!(stream.send.push(second), Ok(()));
+        assert_eq!(stream.send.write(b"", true), Ok(0));
+        assert!(stream.send.is_fin());
     }
 
     #[test]
     fn send_undo_fin() {
         let mut stream = Stream::new(0, 15, true, true);
 
-        let first = b"hello";
-        let second = RangeBuf::from(b"hello", 0, false);
-
-        assert_eq!(stream.send.push_slice(first, true), Ok(5));
+        assert_eq!(stream.send.write(b"hello", true), Ok(5));
         assert!(stream.send.is_fin());
 
-        assert_eq!(stream.send.push(second), Err(Error::FinalSize));
+        assert_eq!(
+            stream.send.write(b"helloworld", true),
+            Err(Error::FinalSize)
+        );
     }
 
     #[test]
     fn send_fin_max_data_match() {
+        let mut buf = [0; 15];
+
         let mut stream = Stream::new(0, 15, true, true);
 
         let slice = b"hellohellohello";
 
-        assert!(stream.send.push_slice(slice, true).is_ok());
+        assert!(stream.send.write(slice, true).is_ok());
 
-        let write = stream.send.pop(15).unwrap();
-        assert_eq!(write.off(), 0);
-        assert_eq!(write.len(), 15);
-        assert_eq!(write.fin(), true);
-        assert_eq!(write.data, slice);
+        let (written, fin) = stream.send.emit(&mut buf[..15]).unwrap();
+        assert_eq!(written, 15);
+        assert_eq!(fin, true);
+        assert_eq!(&buf[..written], slice);
     }
 
     #[test]
     fn send_fin_zero_length() {
+        let mut buf = [0; 5];
+
         let mut stream = Stream::new(0, 15, true, true);
 
-        assert_eq!(stream.send.push_slice(b"hello", false), Ok(5));
-        assert_eq!(stream.send.push_slice(b"", true), Ok(0));
+        assert_eq!(stream.send.write(b"hello", false), Ok(5));
+        assert_eq!(stream.send.write(b"", true), Ok(0));
         assert!(stream.send.is_fin());
 
-        let write = stream.send.pop(5).unwrap();
-        assert_eq!(write.off(), 0);
-        assert_eq!(write.len(), 5);
-        assert_eq!(write.fin(), true);
-        assert_eq!(write.data, b"hello");
+        let (written, fin) = stream.send.emit(&mut buf[..5]).unwrap();
+        assert_eq!(written, 5);
+        assert_eq!(fin, true);
+        assert_eq!(&buf[..written], b"hello");
     }
 
     #[test]
     fn send_ack() {
+        let mut buf = [0; 5];
+
         let mut stream = Stream::new(0, 15, true, true);
 
-        assert_eq!(stream.send.push_slice(b"hello", false), Ok(5));
-        assert_eq!(stream.send.push_slice(b"world", false), Ok(5));
-        assert_eq!(stream.send.push_slice(b"", true), Ok(0));
+        assert_eq!(stream.send.write(b"hello", false), Ok(5));
+        assert_eq!(stream.send.write(b"world", false), Ok(5));
+        assert_eq!(stream.send.write(b"", true), Ok(0));
         assert!(stream.send.is_fin());
 
-        let write = stream.send.pop(5).unwrap();
-        assert_eq!(write.off(), 0);
-        assert_eq!(write.len(), 5);
-        assert_eq!(write.fin(), false);
-        assert_eq!(write.data, b"hello");
+        assert_eq!(stream.send.off_front(), 0);
 
-        stream.send.ack(write.off(), write.len());
+        let (written, fin) = stream.send.emit(&mut buf[..5]).unwrap();
+        assert_eq!(written, 5);
+        assert_eq!(fin, false);
+        assert_eq!(&buf[..written], b"hello");
 
-        assert_eq!(stream.send.push(write), Ok(()));
+        stream.send.ack_and_drop(0, 5);
 
-        let write = stream.send.pop(5).unwrap();
-        assert_eq!(write.off(), 5);
-        assert_eq!(write.len(), 5);
-        assert_eq!(write.fin(), true);
-        assert_eq!(write.data, b"world");
+        stream.send.retransmit(0, 5);
+
+        assert_eq!(stream.send.off_front(), 5);
+
+        let (written, fin) = stream.send.emit(&mut buf[..5]).unwrap();
+        assert_eq!(written, 5);
+        assert_eq!(fin, true);
+        assert_eq!(&buf[..written], b"world");
     }
 
     #[test]
     fn send_ack_reordering() {
+        let mut buf = [0; 5];
+
         let mut stream = Stream::new(0, 15, true, true);
 
-        assert_eq!(stream.send.push_slice(b"hello", false), Ok(5));
-        assert_eq!(stream.send.push_slice(b"world", false), Ok(5));
-        assert_eq!(stream.send.push_slice(b"", true), Ok(0));
+        assert_eq!(stream.send.write(b"hello", false), Ok(5));
+        assert_eq!(stream.send.write(b"world", false), Ok(5));
+        assert_eq!(stream.send.write(b"", true), Ok(0));
         assert!(stream.send.is_fin());
 
-        let write1 = stream.send.pop(5).unwrap();
-        assert_eq!(write1.off(), 0);
-        assert_eq!(write1.len(), 5);
-        assert_eq!(write1.fin(), false);
-        assert_eq!(write1.data, b"hello");
+        assert_eq!(stream.send.off_front(), 0);
 
-        let write2 = stream.send.pop(1).unwrap();
-        assert_eq!(write2.off(), 5);
-        assert_eq!(write2.len(), 1);
-        assert_eq!(write2.fin(), false);
-        assert_eq!(write2.data, b"w");
+        let (written, fin) = stream.send.emit(&mut buf[..5]).unwrap();
+        assert_eq!(written, 5);
+        assert_eq!(fin, false);
+        assert_eq!(&buf[..written], b"hello");
 
-        stream.send.ack(write2.off(), write2.len());
-        stream.send.ack(write1.off(), write1.len());
+        assert_eq!(stream.send.off_front(), 5);
 
-        assert_eq!(stream.send.push(write1), Ok(()));
-        assert_eq!(stream.send.push(write2), Ok(()));
+        let (written, fin) = stream.send.emit(&mut buf[..1]).unwrap();
+        assert_eq!(written, 1);
+        assert_eq!(fin, false);
+        assert_eq!(&buf[..written], b"w");
 
-        let write = stream.send.pop(5).unwrap();
-        assert_eq!(write.off(), 6);
-        assert_eq!(write.len(), 4);
-        assert_eq!(write.fin(), true);
-        assert_eq!(write.data, b"orld");
+        stream.send.ack_and_drop(5, 1);
+        stream.send.ack_and_drop(0, 5);
+
+        stream.send.retransmit(0, 5);
+        stream.send.retransmit(5, 1);
+
+        assert_eq!(stream.send.off_front(), 6);
+
+        let (written, fin) = stream.send.emit(&mut buf[..5]).unwrap();
+        assert_eq!(written, 4);
+        assert_eq!(fin, true);
+        assert_eq!(&buf[..written], b"orld");
     }
 
     #[test]
@@ -2304,18 +2682,18 @@ mod tests {
 
         let first = RangeBuf::from(b"hello", 0, false);
 
-        assert_eq!(stream.recv.push(first), Ok(()));
+        assert_eq!(stream.recv.write(first), Ok(()));
 
         let mut buf = [0; 10];
 
-        let (len, fin) = stream.recv.pop(&mut buf).unwrap();
+        let (len, fin) = stream.recv.emit(&mut buf).unwrap();
         assert_eq!(&buf[..len], b"hello");
         assert_eq!(fin, false);
 
         let first = RangeBuf::from(b"elloworld", 1, true);
-        assert_eq!(stream.recv.push(first), Ok(()));
+        assert_eq!(stream.recv.write(first), Ok(()));
 
-        let (len, fin) = stream.recv.pop(&mut buf).unwrap();
+        let (len, fin) = stream.recv.emit(&mut buf).unwrap();
         assert_eq!(&buf[..len], b"world");
         assert_eq!(fin, true);
     }
@@ -2324,26 +2702,26 @@ mod tests {
     fn stream_complete() {
         let mut stream = Stream::new(30, 30, true, true);
 
-        assert_eq!(stream.send.push_slice(b"hello", false), Ok(5));
-        assert_eq!(stream.send.push_slice(b"world", false), Ok(5));
+        assert_eq!(stream.send.write(b"hello", false), Ok(5));
+        assert_eq!(stream.send.write(b"world", false), Ok(5));
 
         assert!(!stream.send.is_complete());
         assert!(!stream.send.is_fin());
 
-        assert_eq!(stream.send.push_slice(b"", true), Ok(0));
+        assert_eq!(stream.send.write(b"", true), Ok(0));
 
         assert!(!stream.send.is_complete());
         assert!(stream.send.is_fin());
 
         let buf = RangeBuf::from(b"hello", 0, true);
-        assert!(stream.recv.push(buf).is_ok());
+        assert!(stream.recv.write(buf).is_ok());
         assert!(!stream.recv.is_fin());
 
         stream.send.ack(6, 4);
         assert!(!stream.send.is_complete());
 
         let mut buf = [0; 2];
-        assert_eq!(stream.recv.pop(&mut buf), Ok((2, false)));
+        assert_eq!(stream.recv.emit(&mut buf), Ok((2, false)));
         assert!(!stream.recv.is_fin());
 
         stream.send.ack(1, 5);
@@ -2355,7 +2733,7 @@ mod tests {
         assert!(!stream.is_complete());
 
         let mut buf = [0; 3];
-        assert_eq!(stream.recv.pop(&mut buf), Ok((3, true)));
+        assert_eq!(stream.recv.emit(&mut buf), Ok((3, true)));
         assert!(stream.recv.is_fin());
 
         assert!(stream.is_complete());
@@ -2363,24 +2741,372 @@ mod tests {
 
     #[test]
     fn send_fin_zero_length_output() {
+        let mut buf = [0; 5];
+
         let mut stream = Stream::new(0, 15, true, true);
 
-        assert_eq!(stream.send.push_slice(b"hello", false), Ok(5));
+        assert_eq!(stream.send.write(b"hello", false), Ok(5));
+        assert_eq!(stream.send.off_front(), 0);
         assert!(!stream.send.is_fin());
 
-        let write = stream.send.pop(5).unwrap();
-        assert_eq!(write.off(), 0);
-        assert_eq!(write.len(), 5);
-        assert_eq!(write.fin(), false);
-        assert_eq!(write.data, b"hello");
+        let (written, fin) = stream.send.emit(&mut buf).unwrap();
+        assert_eq!(written, 5);
+        assert_eq!(fin, false);
+        assert_eq!(&buf[..written], b"hello");
 
-        assert_eq!(stream.send.push_slice(b"", true), Ok(0));
+        assert_eq!(stream.send.write(b"", true), Ok(0));
         assert!(stream.send.is_fin());
+        assert_eq!(stream.send.off_front(), 5);
 
-        let write = stream.send.pop(5).unwrap();
-        assert_eq!(write.off(), 5);
-        assert_eq!(write.len(), 0);
-        assert_eq!(write.fin(), true);
-        assert_eq!(write.data, b"");
+        let (written, fin) = stream.send.emit(&mut buf).unwrap();
+        assert_eq!(written, 0);
+        assert_eq!(fin, true);
+        assert_eq!(&buf[..written], b"");
+    }
+
+    #[test]
+    fn send_emit() {
+        let mut buf = [0; 5];
+
+        let mut stream = Stream::new(0, 20, true, true);
+
+        assert_eq!(stream.send.write(b"hello", false), Ok(5));
+        assert_eq!(stream.send.write(b"world", false), Ok(5));
+        assert_eq!(stream.send.write(b"olleh", false), Ok(5));
+        assert_eq!(stream.send.write(b"dlrow", true), Ok(5));
+        assert_eq!(stream.send.off_front(), 0);
+        assert_eq!(stream.send.data.len(), 4);
+
+        assert!(stream.is_flushable());
+
+        assert!(stream.send.ready());
+        assert_eq!(stream.send.emit(&mut buf[..4]), Ok((4, false)));
+        assert_eq!(stream.send.off_front(), 4);
+        assert_eq!(&buf[..4], b"hell");
+
+        assert!(stream.send.ready());
+        assert_eq!(stream.send.emit(&mut buf[..4]), Ok((4, false)));
+        assert_eq!(stream.send.off_front(), 8);
+        assert_eq!(&buf[..4], b"owor");
+
+        assert!(stream.send.ready());
+        assert_eq!(stream.send.emit(&mut buf[..2]), Ok((2, false)));
+        assert_eq!(stream.send.off_front(), 10);
+        assert_eq!(&buf[..2], b"ld");
+
+        assert!(stream.send.ready());
+        assert_eq!(stream.send.emit(&mut buf[..1]), Ok((1, false)));
+        assert_eq!(stream.send.off_front(), 11);
+        assert_eq!(&buf[..1], b"o");
+
+        assert!(stream.send.ready());
+        assert_eq!(stream.send.emit(&mut buf[..5]), Ok((5, false)));
+        assert_eq!(stream.send.off_front(), 16);
+        assert_eq!(&buf[..5], b"llehd");
+
+        assert!(stream.send.ready());
+        assert_eq!(stream.send.emit(&mut buf[..5]), Ok((4, true)));
+        assert_eq!(stream.send.off_front(), 20);
+        assert_eq!(&buf[..4], b"lrow");
+
+        assert!(!stream.is_flushable());
+
+        assert!(!stream.send.ready());
+        assert_eq!(stream.send.emit(&mut buf[..5]), Ok((0, true)));
+        assert_eq!(stream.send.off_front(), 20);
+    }
+
+    #[test]
+    fn send_emit_ack() {
+        let mut buf = [0; 5];
+
+        let mut stream = Stream::new(0, 20, true, true);
+
+        assert_eq!(stream.send.write(b"hello", false), Ok(5));
+        assert_eq!(stream.send.write(b"world", false), Ok(5));
+        assert_eq!(stream.send.write(b"olleh", false), Ok(5));
+        assert_eq!(stream.send.write(b"dlrow", true), Ok(5));
+        assert_eq!(stream.send.off_front(), 0);
+        assert_eq!(stream.send.data.len(), 4);
+
+        assert!(stream.is_flushable());
+
+        assert!(stream.send.ready());
+        assert_eq!(stream.send.emit(&mut buf[..4]), Ok((4, false)));
+        assert_eq!(stream.send.off_front(), 4);
+        assert_eq!(&buf[..4], b"hell");
+
+        assert!(stream.send.ready());
+        assert_eq!(stream.send.emit(&mut buf[..4]), Ok((4, false)));
+        assert_eq!(stream.send.off_front(), 8);
+        assert_eq!(&buf[..4], b"owor");
+
+        stream.send.ack_and_drop(0, 5);
+        assert_eq!(stream.send.data.len(), 3);
+
+        assert!(stream.send.ready());
+        assert_eq!(stream.send.emit(&mut buf[..2]), Ok((2, false)));
+        assert_eq!(stream.send.off_front(), 10);
+        assert_eq!(&buf[..2], b"ld");
+
+        stream.send.ack_and_drop(7, 5);
+        assert_eq!(stream.send.data.len(), 3);
+
+        assert!(stream.send.ready());
+        assert_eq!(stream.send.emit(&mut buf[..1]), Ok((1, false)));
+        assert_eq!(stream.send.off_front(), 11);
+        assert_eq!(&buf[..1], b"o");
+
+        assert!(stream.send.ready());
+        assert_eq!(stream.send.emit(&mut buf[..5]), Ok((5, false)));
+        assert_eq!(stream.send.off_front(), 16);
+        assert_eq!(&buf[..5], b"llehd");
+
+        stream.send.ack_and_drop(5, 7);
+        assert_eq!(stream.send.data.len(), 2);
+
+        assert!(stream.send.ready());
+        assert_eq!(stream.send.emit(&mut buf[..5]), Ok((4, true)));
+        assert_eq!(stream.send.off_front(), 20);
+        assert_eq!(&buf[..4], b"lrow");
+
+        assert!(!stream.is_flushable());
+
+        assert!(!stream.send.ready());
+        assert_eq!(stream.send.emit(&mut buf[..5]), Ok((0, true)));
+        assert_eq!(stream.send.off_front(), 20);
+
+        stream.send.ack_and_drop(22, 4);
+        assert_eq!(stream.send.data.len(), 2);
+
+        stream.send.ack_and_drop(20, 1);
+        assert_eq!(stream.send.data.len(), 2);
+    }
+
+    #[test]
+    fn send_emit_retransmit() {
+        let mut buf = [0; 5];
+
+        let mut stream = Stream::new(0, 20, true, true);
+
+        assert_eq!(stream.send.write(b"hello", false), Ok(5));
+        assert_eq!(stream.send.write(b"world", false), Ok(5));
+        assert_eq!(stream.send.write(b"olleh", false), Ok(5));
+        assert_eq!(stream.send.write(b"dlrow", true), Ok(5));
+        assert_eq!(stream.send.off_front(), 0);
+        assert_eq!(stream.send.data.len(), 4);
+
+        assert!(stream.is_flushable());
+
+        assert!(stream.send.ready());
+        assert_eq!(stream.send.emit(&mut buf[..4]), Ok((4, false)));
+        assert_eq!(stream.send.off_front(), 4);
+        assert_eq!(&buf[..4], b"hell");
+
+        assert!(stream.send.ready());
+        assert_eq!(stream.send.emit(&mut buf[..4]), Ok((4, false)));
+        assert_eq!(stream.send.off_front(), 8);
+        assert_eq!(&buf[..4], b"owor");
+
+        stream.send.retransmit(3, 3);
+        assert_eq!(stream.send.off_front(), 3);
+
+        assert!(stream.send.ready());
+        assert_eq!(stream.send.emit(&mut buf[..3]), Ok((3, false)));
+        assert_eq!(stream.send.off_front(), 8);
+        assert_eq!(&buf[..3], b"low");
+
+        assert!(stream.send.ready());
+        assert_eq!(stream.send.emit(&mut buf[..2]), Ok((2, false)));
+        assert_eq!(stream.send.off_front(), 10);
+        assert_eq!(&buf[..2], b"ld");
+
+        stream.send.ack_and_drop(7, 2);
+
+        stream.send.retransmit(8, 2);
+
+        assert!(stream.send.ready());
+        assert_eq!(stream.send.emit(&mut buf[..2]), Ok((2, false)));
+        assert_eq!(stream.send.off_front(), 10);
+        assert_eq!(&buf[..2], b"ld");
+
+        assert!(stream.send.ready());
+        assert_eq!(stream.send.emit(&mut buf[..1]), Ok((1, false)));
+        assert_eq!(stream.send.off_front(), 11);
+        assert_eq!(&buf[..1], b"o");
+
+        assert!(stream.send.ready());
+        assert_eq!(stream.send.emit(&mut buf[..5]), Ok((5, false)));
+        assert_eq!(stream.send.off_front(), 16);
+        assert_eq!(&buf[..5], b"llehd");
+
+        stream.send.retransmit(12, 2);
+
+        assert!(stream.send.ready());
+        assert_eq!(stream.send.emit(&mut buf[..2]), Ok((2, false)));
+        assert_eq!(stream.send.off_front(), 16);
+        assert_eq!(&buf[..2], b"le");
+
+        assert!(stream.send.ready());
+        assert_eq!(stream.send.emit(&mut buf[..5]), Ok((4, true)));
+        assert_eq!(stream.send.off_front(), 20);
+        assert_eq!(&buf[..4], b"lrow");
+
+        assert!(!stream.is_flushable());
+
+        assert!(!stream.send.ready());
+        assert_eq!(stream.send.emit(&mut buf[..5]), Ok((0, true)));
+        assert_eq!(stream.send.off_front(), 20);
+
+        stream.send.retransmit(7, 12);
+
+        assert!(stream.send.ready());
+        assert_eq!(stream.send.emit(&mut buf[..5]), Ok((5, false)));
+        assert_eq!(stream.send.off_front(), 12);
+        assert_eq!(&buf[..5], b"rldol");
+
+        assert!(stream.send.ready());
+        assert_eq!(stream.send.emit(&mut buf[..5]), Ok((5, false)));
+        assert_eq!(stream.send.off_front(), 17);
+        assert_eq!(&buf[..5], b"lehdl");
+
+        assert!(stream.send.ready());
+        assert_eq!(stream.send.emit(&mut buf[..5]), Ok((2, false)));
+        assert_eq!(stream.send.off_front(), 20);
+        assert_eq!(&buf[..2], b"ro");
+
+        stream.send.ack_and_drop(12, 7);
+
+        stream.send.retransmit(7, 12);
+
+        assert!(stream.send.ready());
+        assert_eq!(stream.send.emit(&mut buf[..5]), Ok((5, false)));
+        assert_eq!(stream.send.off_front(), 12);
+        assert_eq!(&buf[..5], b"rldol");
+
+        assert!(stream.send.ready());
+        assert_eq!(stream.send.emit(&mut buf[..5]), Ok((5, false)));
+        assert_eq!(stream.send.off_front(), 17);
+        assert_eq!(&buf[..5], b"lehdl");
+
+        assert!(stream.send.ready());
+        assert_eq!(stream.send.emit(&mut buf[..5]), Ok((2, false)));
+        assert_eq!(stream.send.off_front(), 20);
+        assert_eq!(&buf[..2], b"ro");
+    }
+
+    #[test]
+    fn rangebuf_split_off() {
+        let mut buf = RangeBuf::from(b"helloworld", 5, true);
+        assert_eq!(buf.start, 0);
+        assert_eq!(buf.pos, 0);
+        assert_eq!(buf.len, 10);
+        assert_eq!(buf.off, 5);
+        assert_eq!(buf.fin, true);
+
+        assert_eq!(buf.len(), 10);
+        assert_eq!(buf.off(), 5);
+        assert_eq!(buf.fin(), true);
+
+        buf.with(|s| assert_eq!(s, b"helloworld"));
+
+        // Advance buffer.
+        buf.consume(5);
+
+        assert_eq!(buf.start, 0);
+        assert_eq!(buf.pos, 5);
+        assert_eq!(buf.len, 10);
+        assert_eq!(buf.off, 5);
+        assert_eq!(buf.fin, true);
+
+        assert_eq!(buf.len(), 5);
+        assert_eq!(buf.off(), 10);
+        assert_eq!(buf.fin(), true);
+
+        buf.with(|s| assert_eq!(s, b"world"));
+
+        // Split buffer before position.
+        let mut new_buf = buf.split_off(3);
+
+        assert_eq!(buf.start, 0);
+        assert_eq!(buf.pos, 3);
+        assert_eq!(buf.len, 3);
+        assert_eq!(buf.off, 5);
+        assert_eq!(buf.fin, false);
+
+        assert_eq!(buf.len(), 0);
+        assert_eq!(buf.off(), 8);
+        assert_eq!(buf.fin(), false);
+
+        buf.with(|s| assert_eq!(s, b""));
+
+        assert_eq!(new_buf.start, 3);
+        assert_eq!(new_buf.pos, 5);
+        assert_eq!(new_buf.len, 7);
+        assert_eq!(new_buf.off, 8);
+        assert_eq!(new_buf.fin, true);
+
+        assert_eq!(new_buf.len(), 5);
+        assert_eq!(new_buf.off(), 10);
+        assert_eq!(new_buf.fin(), true);
+
+        new_buf.with(|s| assert_eq!(s, b"world"));
+
+        // Advance buffer.
+        new_buf.consume(2);
+
+        assert_eq!(new_buf.start, 3);
+        assert_eq!(new_buf.pos, 7);
+        assert_eq!(new_buf.len, 7);
+        assert_eq!(new_buf.off, 8);
+        assert_eq!(new_buf.fin, true);
+
+        assert_eq!(new_buf.len(), 3);
+        assert_eq!(new_buf.off(), 12);
+        assert_eq!(new_buf.fin(), true);
+
+        new_buf.with(|s| assert_eq!(s, b"rld"));
+
+        // Split buffer after position.
+        let mut new_new_buf = new_buf.split_off(5);
+
+        assert_eq!(new_buf.start, 3);
+        assert_eq!(new_buf.pos, 7);
+        assert_eq!(new_buf.len, 5);
+        assert_eq!(new_buf.off, 8);
+        assert_eq!(new_buf.fin, false);
+
+        assert_eq!(new_buf.len(), 1);
+        assert_eq!(new_buf.off(), 12);
+        assert_eq!(new_buf.fin(), false);
+
+        new_buf.with(|s| assert_eq!(s, b"r"));
+
+        assert_eq!(new_new_buf.start, 8);
+        assert_eq!(new_new_buf.pos, 8);
+        assert_eq!(new_new_buf.len, 2);
+        assert_eq!(new_new_buf.off, 13);
+        assert_eq!(new_new_buf.fin, true);
+
+        assert_eq!(new_new_buf.len(), 2);
+        assert_eq!(new_new_buf.off(), 13);
+        assert_eq!(new_new_buf.fin(), true);
+
+        new_new_buf.with(|s| assert_eq!(s, b"ld"));
+
+        // Advance buffer.
+        new_new_buf.consume(2);
+
+        assert_eq!(new_new_buf.start, 8);
+        assert_eq!(new_new_buf.pos, 10);
+        assert_eq!(new_new_buf.len, 2);
+        assert_eq!(new_new_buf.off, 13);
+        assert_eq!(new_new_buf.fin, true);
+
+        assert_eq!(new_new_buf.len(), 0);
+        assert_eq!(new_new_buf.off(), 15);
+        assert_eq!(new_new_buf.fin(), true);
+
+        new_new_buf.with(|s| assert_eq!(s, b""));
     }
 }

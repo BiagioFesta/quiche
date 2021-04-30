@@ -427,6 +427,11 @@ static void recv_cb(EV_P_ ev_io *w, int revents) {
 
                     case QUICHE_H3_EVENT_DATAGRAM:
                         break;
+
+                    case QUICHE_H3_EVENT_GOAWAY: {
+                        fprintf(stderr, "got GOAWAY\n");
+                        break;
+                    }
                 }
 
                 quiche_h3_event_free(ev);
@@ -527,7 +532,8 @@ int main(int argc, char *argv[]) {
         sizeof(QUICHE_H3_APPLICATION_PROTOCOL) - 1);
 
     quiche_config_set_max_idle_timeout(config, 5000);
-    quiche_config_set_max_udp_payload_size(config, MAX_DATAGRAM_SIZE);
+    quiche_config_set_max_recv_udp_payload_size(config, MAX_DATAGRAM_SIZE);
+    quiche_config_set_max_send_udp_payload_size(config, MAX_DATAGRAM_SIZE);
     quiche_config_set_initial_max_data(config, 10000000);
     quiche_config_set_initial_max_stream_data_bidi_local(config, 1000000);
     quiche_config_set_initial_max_stream_data_bidi_remote(config, 1000000);

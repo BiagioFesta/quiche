@@ -53,7 +53,8 @@ struct Client {
     partial_responses: HashMap<u64, PartialResponse>,
 }
 
-type ClientMap = HashMap<Vec<u8>, (net::SocketAddr, Client)>;
+type ClientMap =
+    HashMap<quiche::ConnectionId<'static>, (net::SocketAddr, Client)>;
 
 fn main() {
     let mut buf = [0; 65535];
@@ -100,7 +101,8 @@ fn main() {
         .unwrap();
 
     config.set_max_idle_timeout(5000);
-    config.set_max_udp_payload_size(MAX_DATAGRAM_SIZE as u64);
+    config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
+    config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
     config.set_initial_max_data(10_000_000);
     config.set_initial_max_stream_data_bidi_local(1_000_000);
     config.set_initial_max_stream_data_bidi_remote(1_000_000);
@@ -177,11 +179,12 @@ fn main() {
 
             let conn_id = ring::hmac::sign(&conn_id_seed, &hdr.dcid);
             let conn_id = &conn_id.as_ref()[..quiche::MAX_CONN_ID_LEN];
+            let conn_id = conn_id.to_vec().into();
 
             // Lookup a connection based on the packet's connection ID. If there
             // is no connection matching, create a new one.
             let (_, client) = if !clients.contains_key(&hdr.dcid) &&
-                !clients.contains_key(conn_id)
+                !clients.contains_key(&conn_id)
             {
                 if hdr.ty != quiche::Type::Initial {
                     error!("Packet is not Initial");
@@ -210,6 +213,8 @@ fn main() {
 
                 let mut scid = [0; quiche::MAX_CONN_ID_LEN];
                 scid.copy_from_slice(&conn_id);
+
+                let scid = quiche::ConnectionId::from_ref(&scid);
 
                 // Token is always present in Initial packets.
                 let token = hdr.token.as_ref().unwrap();
@@ -247,7 +252,7 @@ fn main() {
 
                 // The token was not valid, meaning the retry failed, so
                 // drop the packet.
-                if odcid == None {
+                if odcid.is_none() {
                     error!("Invalid address validation token");
                     continue 'read;
                 }
@@ -257,17 +262,14 @@ fn main() {
                     continue 'read;
                 }
 
-                // Reuse the source connection ID we sent in the Retry
-                // packet, instead of changing it again.
-                scid.copy_from_slice(&hdr.dcid);
+                // Reuse the source connection ID we sent in the Retry packet,
+                // instead of changing it again.
+                let scid = hdr.dcid.clone();
 
-                debug!(
-                    "New connection: dcid={} scid={}",
-                    hex_dump(&hdr.dcid),
-                    hex_dump(&scid)
-                );
+                debug!("New connection: dcid={:?} scid={:?}", hdr.dcid, scid);
 
-                let conn = quiche::accept(&scid, odcid, &mut config).unwrap();
+                let conn =
+                    quiche::accept(&scid, odcid.as_ref(), &mut config).unwrap();
 
                 let client = Client {
                     conn,
@@ -275,14 +277,14 @@ fn main() {
                     partial_responses: HashMap::new(),
                 };
 
-                clients.insert(scid.to_vec(), (src, client));
+                clients.insert(scid.clone(), (src, client));
 
-                clients.get_mut(&scid[..]).unwrap()
+                clients.get_mut(&scid).unwrap()
             } else {
                 match clients.get_mut(&hdr.dcid) {
                     Some(v) => v,
 
-                    None => clients.get_mut(conn_id).unwrap(),
+                    None => clients.get_mut(&conn_id).unwrap(),
                 }
             };
 
@@ -358,6 +360,8 @@ fn main() {
                         Ok((_stream_id, quiche::h3::Event::Finished)) => (),
 
                         Ok((_flow_id, quiche::h3::Event::Datagram)) => (),
+
+                        Ok((_goaway_id, quiche::h3::Event::GoAway)) => (),
 
                         Err(quiche::h3::Error::Done) => {
                             break;
@@ -462,7 +466,7 @@ fn mint_token(hdr: &quiche::Header, src: &net::SocketAddr) -> Vec<u8> {
 /// authenticate of the token. *It should not be used in production system*.
 fn validate_token<'a>(
     src: &net::SocketAddr, token: &'a [u8],
-) -> Option<&'a [u8]> {
+) -> Option<quiche::ConnectionId<'a>> {
     if token.len() < 6 {
         return None;
     }
@@ -482,9 +486,7 @@ fn validate_token<'a>(
         return None;
     }
 
-    let token = &token[addr.len()..];
-
-    Some(&token[..])
+    Some(quiche::ConnectionId::from_ref(&token[addr.len()..]))
 }
 
 /// Handles incoming HTTP/3 requests.
@@ -532,6 +534,8 @@ fn handle_request(
 
     let written = match http3_conn.send_body(conn, stream_id, &body, true) {
         Ok(v) => v,
+
+        Err(quiche::h3::Error::Done) => 0,
 
         Err(e) => {
             error!("{} stream send failed {:?}", conn.trace_id(), e);
@@ -635,7 +639,11 @@ fn handle_writable(client: &mut Client, stream_id: u64) {
     let written = match http3_conn.send_body(conn, stream_id, body, true) {
         Ok(v) => v,
 
+        Err(quiche::h3::Error::Done) => 0,
+
         Err(e) => {
+            client.partial_responses.remove(&stream_id);
+
             error!("{} stream send failed {:?}", conn.trace_id(), e);
             return;
         },
@@ -646,10 +654,4 @@ fn handle_writable(client: &mut Client, stream_id: u64) {
     if resp.written == resp.body.len() {
         client.partial_responses.remove(&stream_id);
     }
-}
-
-fn hex_dump(buf: &[u8]) -> String {
-    let vec: Vec<String> = buf.iter().map(|b| format!("{:02x}", b)).collect();
-
-    vec.join("")
 }

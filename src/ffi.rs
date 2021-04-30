@@ -116,6 +116,19 @@ pub extern fn quiche_config_load_priv_key_from_pem_file(
 }
 
 #[no_mangle]
+pub extern fn quiche_config_load_verify_locations_from_file(
+    config: &mut Config, path: *const c_char,
+) -> c_int {
+    let path = unsafe { ffi::CStr::from_ptr(path).to_str().unwrap() };
+
+    match config.load_verify_locations_from_file(path) {
+        Ok(_) => 0,
+
+        Err(e) => e.to_c() as c_int,
+    }
+}
+
+#[no_mangle]
 pub extern fn quiche_config_verify_peer(config: &mut Config, v: bool) {
     config.verify_peer(v);
 }
@@ -154,10 +167,10 @@ pub extern fn quiche_config_set_max_idle_timeout(config: &mut Config, v: u64) {
 }
 
 #[no_mangle]
-pub extern fn quiche_config_set_max_udp_payload_size(
-    config: &mut Config, v: u64,
+pub extern fn quiche_config_set_max_recv_udp_payload_size(
+    config: &mut Config, v: size_t,
 ) {
-    config.set_max_udp_payload_size(v);
+    config.set_max_recv_udp_payload_size(v);
 }
 
 #[no_mangle]
@@ -257,6 +270,13 @@ pub extern fn quiche_config_enable_dgram(
 }
 
 #[no_mangle]
+pub extern fn quiche_config_set_max_send_udp_payload_size(
+    config: &mut Config, v: size_t,
+) {
+    config.set_max_send_udp_payload_size(v);
+}
+
+#[no_mangle]
 pub extern fn quiche_config_free(config: *mut Config) {
     unsafe { Box::from_raw(config) };
 }
@@ -332,14 +352,17 @@ pub extern fn quiche_accept(
     config: &mut Config,
 ) -> *mut Connection {
     let scid = unsafe { slice::from_raw_parts(scid, scid_len) };
+    let scid = ConnectionId::from_ref(scid);
 
-    let odcid = if !odcid.is_null() || odcid_len == 0 {
-        Some(unsafe { slice::from_raw_parts(odcid, odcid_len) })
+    let odcid = if !odcid.is_null() && odcid_len > 0 {
+        Some(ConnectionId::from_ref(unsafe {
+            slice::from_raw_parts(odcid, odcid_len)
+        }))
     } else {
         None
     };
 
-    match accept(scid, odcid, config) {
+    match accept(&scid, odcid.as_ref(), config) {
         Ok(c) => Box::into_raw(Pin::into_inner(c)),
 
         Err(_) => ptr::null_mut(),
@@ -358,8 +381,9 @@ pub extern fn quiche_connect(
     };
 
     let scid = unsafe { slice::from_raw_parts(scid, scid_len) };
+    let scid = ConnectionId::from_ref(scid);
 
-    match connect(server_name, scid, config) {
+    match connect(server_name, &scid, config) {
         Ok(c) => Box::into_raw(Pin::into_inner(c)),
 
         Err(_) => ptr::null_mut(),
@@ -372,10 +396,14 @@ pub extern fn quiche_negotiate_version(
     out: *mut u8, out_len: size_t,
 ) -> ssize_t {
     let scid = unsafe { slice::from_raw_parts(scid, scid_len) };
+    let scid = ConnectionId::from_ref(scid);
+
     let dcid = unsafe { slice::from_raw_parts(dcid, dcid_len) };
+    let dcid = ConnectionId::from_ref(dcid);
+
     let out = unsafe { slice::from_raw_parts_mut(out, out_len) };
 
-    match negotiate_version(scid, dcid, out) {
+    match negotiate_version(&scid, &dcid, out) {
         Ok(v) => v as ssize_t,
 
         Err(e) => e.to_c(),
@@ -394,12 +422,18 @@ pub extern fn quiche_retry(
     token_len: size_t, version: u32, out: *mut u8, out_len: size_t,
 ) -> ssize_t {
     let scid = unsafe { slice::from_raw_parts(scid, scid_len) };
+    let scid = ConnectionId::from_ref(scid);
+
     let dcid = unsafe { slice::from_raw_parts(dcid, dcid_len) };
+    let dcid = ConnectionId::from_ref(dcid);
+
     let new_scid = unsafe { slice::from_raw_parts(new_scid, new_scid_len) };
+    let new_scid = ConnectionId::from_ref(new_scid);
+
     let token = unsafe { slice::from_raw_parts(token, token_len) };
     let out = unsafe { slice::from_raw_parts_mut(out, out_len) };
 
-    match retry(scid, dcid, new_scid, token, version, out) {
+    match retry(&scid, &dcid, &new_scid, token, version, out) {
         Ok(v) => v as ssize_t,
 
         Err(e) => e.to_c(),
@@ -412,16 +446,19 @@ pub extern fn quiche_conn_new_with_tls(
     config: &mut Config, ssl: *mut c_void, is_server: bool,
 ) -> *mut Connection {
     let scid = unsafe { slice::from_raw_parts(scid, scid_len) };
+    let scid = ConnectionId::from_ref(scid);
 
-    let odcid = if !odcid.is_null() || odcid_len == 0 {
-        Some(unsafe { slice::from_raw_parts(odcid, odcid_len) })
+    let odcid = if !odcid.is_null() && odcid_len > 0 {
+        Some(ConnectionId::from_ref(unsafe {
+            slice::from_raw_parts(odcid, odcid_len)
+        }))
     } else {
         None
     };
 
     let tls = unsafe { tls::Handshake::from_ptr(ssl) };
 
-    match Connection::with_tls(scid, odcid, config, tls, is_server) {
+    match Connection::with_tls(&scid, odcid.as_ref(), config, tls, is_server) {
         Ok(c) => Box::into_raw(Pin::into_inner(c)),
 
         Err(_) => ptr::null_mut(),
@@ -584,6 +621,17 @@ pub extern fn quiche_conn_stream_send(
 }
 
 #[no_mangle]
+pub extern fn quiche_conn_stream_priority(
+    conn: &mut Connection, stream_id: u64, urgency: u8, incremental: bool,
+) -> c_int {
+    match conn.stream_priority(stream_id, urgency, incremental) {
+        Ok(_) => 0,
+
+        Err(e) => e.to_c() as c_int,
+    }
+}
+
+#[no_mangle]
 pub extern fn quiche_conn_stream_shutdown(
     conn: &mut Connection, stream_id: u64, direction: Shutdown, err: u64,
 ) -> c_int {
@@ -606,6 +654,13 @@ pub extern fn quiche_conn_stream_capacity(
 }
 
 #[no_mangle]
+pub extern fn quiche_conn_stream_readable(
+    conn: &mut Connection, stream_id: u64,
+) -> bool {
+    conn.stream_readable(stream_id)
+}
+
+#[no_mangle]
 pub extern fn quiche_conn_stream_finished(
     conn: &mut Connection, stream_id: u64,
 ) -> bool {
@@ -622,8 +677,19 @@ pub extern fn quiche_conn_writable(conn: &Connection) -> *mut StreamIter {
     Box::into_raw(Box::new(conn.writable()))
 }
 
+#[no_mangle]
+pub extern fn quiche_conn_max_send_udp_payload_size(conn: &Connection) -> usize {
+    conn.max_send_udp_payload_size()
+}
+
+#[no_mangle]
+pub extern fn quiche_conn_is_readable(conn: &Connection) -> bool {
+    conn.is_readable()
+}
+
 struct AppData(*mut c_void);
 unsafe impl Send for AppData {}
+unsafe impl Sync for AppData {}
 
 #[no_mangle]
 pub extern fn quiche_conn_stream_init_application_data(
@@ -685,6 +751,16 @@ pub extern fn quiche_conn_on_timeout(conn: &mut Connection) {
 }
 
 #[no_mangle]
+pub extern fn quiche_conn_trace_id(
+    conn: &mut Connection, out: &mut *const u8, out_len: &mut size_t,
+) {
+    let trace_id = conn.trace_id();
+
+    *out = trace_id.as_ptr();
+    *out_len = trace_id.len();
+}
+
+#[no_mangle]
 pub extern fn quiche_conn_application_proto(
     conn: &mut Connection, out: &mut *const u8, out_len: &mut size_t,
 ) {
@@ -705,8 +781,32 @@ pub extern fn quiche_conn_is_in_early_data(conn: &mut Connection) -> bool {
 }
 
 #[no_mangle]
+pub extern fn quiche_conn_is_draining(conn: &mut Connection) -> bool {
+    conn.is_draining()
+}
+
+#[no_mangle]
 pub extern fn quiche_conn_is_closed(conn: &mut Connection) -> bool {
     conn.is_closed()
+}
+
+#[no_mangle]
+pub extern fn quiche_conn_peer_error(
+    conn: &mut Connection, is_app: *mut bool, error_code: *mut u64,
+    reason: &mut *const u8, reason_len: &mut size_t,
+) -> bool {
+    match &conn.peer_error {
+        Some(conn_err) => unsafe {
+            *is_app = conn_err.is_app;
+            *error_code = conn_err.error_code;
+            *reason = conn_err.reason.as_ptr();
+            *reason_len = conn_err.reason.len();
+
+            true
+        },
+
+        None => false,
+    }
 }
 
 #[no_mangle]
@@ -751,6 +851,15 @@ pub extern fn quiche_conn_stats(conn: &Connection, out: &mut Stats) {
 #[no_mangle]
 pub extern fn quiche_conn_dgram_max_writable_len(conn: &Connection) -> ssize_t {
     match conn.dgram_max_writable_len() {
+        None => Error::Done.to_c(),
+
+        Some(v) => v as ssize_t,
+    }
+}
+
+#[no_mangle]
+pub extern fn quiche_conn_dgram_recv_front_len(conn: &Connection) -> ssize_t {
+    match conn.dgram_recv_front_len() {
         None => Error::Done.to_c(),
 
         Some(v) => v as ssize_t,
@@ -808,4 +917,14 @@ pub extern fn quiche_conn_dgram_purge_outgoing(
 #[no_mangle]
 pub extern fn quiche_conn_free(conn: *mut Connection) {
     unsafe { Box::from_raw(conn) };
+}
+
+#[no_mangle]
+pub extern fn quiche_conn_peer_streams_left_bidi(conn: &mut Connection) -> u64 {
+    conn.peer_streams_left_bidi()
+}
+
+#[no_mangle]
+pub extern fn quiche_conn_peer_streams_left_uni(conn: &mut Connection) -> u64 {
+    conn.peer_streams_left_uni()
 }

@@ -89,7 +89,8 @@ fn main() {
         .unwrap();
 
     config.set_max_idle_timeout(5000);
-    config.set_max_udp_payload_size(MAX_DATAGRAM_SIZE as u64);
+    config.set_max_recv_udp_payload_size(MAX_DATAGRAM_SIZE);
+    config.set_max_send_udp_payload_size(MAX_DATAGRAM_SIZE);
     config.set_initial_max_data(10_000_000);
     config.set_initial_max_stream_data_bidi_local(1_000_000);
     config.set_initial_max_stream_data_bidi_remote(1_000_000);
@@ -103,6 +104,8 @@ fn main() {
     // Generate a random source connection ID for the connection.
     let mut scid = [0; quiche::MAX_CONN_ID_LEN];
     SystemRandom::new().fill(&mut scid[..]).unwrap();
+
+    let scid = quiche::ConnectionId::from_ref(&scid);
 
     // Create a QUIC connection and initiate handshake.
     let mut conn = quiche::connect(url.domain(), &scid, &mut config).unwrap();
@@ -235,7 +238,7 @@ fn main() {
                     },
 
                     Ok((stream_id, quiche::h3::Event::Data)) => {
-                        if let Ok(read) =
+                        while let Ok(read) =
                             http3_conn.recv_body(&mut conn, stream_id, &mut buf)
                         {
                             debug!(
@@ -259,6 +262,10 @@ fn main() {
                     },
 
                     Ok((_flow_id, quiche::h3::Event::Datagram)) => (),
+
+                    Ok((goaway_id, quiche::h3::Event::GoAway)) => {
+                        info!("GOAWAY id={}", goaway_id);
+                    },
 
                     Err(quiche::h3::Error::Done) => {
                         break;

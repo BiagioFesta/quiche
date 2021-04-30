@@ -113,6 +113,8 @@ pub extern fn quiche_h3_event_type(ev: &h3::Event) -> u32 {
         h3::Event::Finished { .. } => 2,
 
         h3::Event::Datagram { .. } => 3,
+
+        h3::Event::GoAway { .. } => 4,
     }
 }
 
@@ -259,6 +261,13 @@ pub extern fn quiche_h3_recv_body(
 
         Err(e) => e.to_c(),
     }
+}
+
+#[no_mangle]
+pub extern fn quiche_h3_dgram_enabled_by_peer(
+    conn: &h3::Connection, quic_conn: &Connection,
+) -> bool {
+    conn.dgram_enabled_by_peer(quic_conn)
 }
 
 #[no_mangle]

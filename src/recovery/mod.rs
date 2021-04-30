@@ -60,13 +60,12 @@ const MAX_PTO_PROBES_COUNT: usize = 2;
 // Congestion Control
 const INITIAL_WINDOW_PACKETS: usize = 10;
 
-const INITIAL_WINDOW: usize = INITIAL_WINDOW_PACKETS * MAX_DATAGRAM_SIZE;
-
-const MINIMUM_WINDOW: usize = 2 * MAX_DATAGRAM_SIZE;
-
-const MAX_DATAGRAM_SIZE: usize = 1452;
+const MINIMUM_WINDOW_PACKETS: usize = 2;
 
 const LOSS_REDUCTION_FACTOR: f64 = 0.5;
+
+// RFC3465 Slow Start burst limit constant
+const ABC_L: usize = 2;
 
 pub struct Recovery {
     loss_detection_timer: Option<Instant>,
@@ -118,9 +117,13 @@ pub struct Recovery {
 
     ssthresh: usize,
 
-    bytes_acked: usize,
+    bytes_acked_sl: usize,
+
+    bytes_acked_ca: usize,
 
     congestion_recovery_start_time: Option<Instant>,
+
+    max_datagram_size: usize,
 
     cubic_state: cubic::State,
 
@@ -171,15 +174,20 @@ impl Recovery {
 
             in_flight_count: [0; packet::EPOCH_COUNT],
 
-            congestion_window: INITIAL_WINDOW,
+            congestion_window: config.max_send_udp_payload_size *
+                INITIAL_WINDOW_PACKETS,
 
             bytes_in_flight: 0,
 
             ssthresh: std::usize::MAX,
 
-            bytes_acked: 0,
+            bytes_acked_sl: 0,
+
+            bytes_acked_ca: 0,
 
             congestion_recovery_start_time: None,
+
+            max_datagram_size: config.max_send_udp_payload_size,
 
             cc_ops: config.cc_algorithm.into(),
 
@@ -347,8 +355,6 @@ impl Recovery {
 
         self.drain_packets(epoch);
 
-        trace!("{} {:?}", trace_id, self);
-
         Ok(())
     }
 
@@ -467,6 +473,24 @@ impl Recovery {
 
     pub fn delivery_rate(&self) -> u64 {
         self.delivery_rate.delivery_rate()
+    }
+
+    pub fn max_datagram_size(&self) -> usize {
+        self.max_datagram_size
+    }
+
+    pub fn update_max_datagram_size(&mut self, new_max_datagram_size: usize) {
+        let max_datagram_size =
+            cmp::min(self.max_datagram_size, new_max_datagram_size);
+
+        // Congestion Window is updated only when it's not updated already.
+        if self.congestion_window ==
+            self.max_datagram_size * INITIAL_WINDOW_PACKETS
+        {
+            self.congestion_window = max_datagram_size * INITIAL_WINDOW_PACKETS;
+        }
+
+        self.max_datagram_size = max_datagram_size;
     }
 
     fn update_rtt(
@@ -695,6 +719,8 @@ impl Recovery {
         for pkt in acked {
             (self.cc_ops.on_packet_acked)(self, &pkt, epoch, now);
         }
+
+        self.bytes_acked_sl = 0;
     }
 
     fn in_congestion_recovery(&self, sent_time: Instant) -> bool {
@@ -729,6 +755,10 @@ impl Recovery {
     fn congestion_event(
         &mut self, time_sent: Instant, epoch: packet::Epoch, now: Instant,
     ) {
+        if !self.in_congestion_recovery(time_sent) {
+            (self.cc_ops.checkpoint)(self);
+        }
+
         (self.cc_ops.congestion_event)(self, time_sent, epoch, now);
     }
 
@@ -740,18 +770,6 @@ impl Recovery {
         if self.app_limited {
             self.delivery_rate.check_app_limited(self.bytes_in_flight)
         }
-    }
-
-    fn hystart_on_packet_acked(
-        &mut self, packet: &Acked, now: Instant,
-    ) -> (usize, usize) {
-        self.hystart.on_packet_acked(
-            packet,
-            self.latest_rtt,
-            self.congestion_window,
-            self.ssthresh,
-            now,
-        )
     }
 
     pub fn update_app_limited(&mut self, v: bool) {
@@ -825,6 +843,10 @@ pub struct CongestionControlOps {
     ),
 
     pub collapse_cwnd: fn(r: &mut Recovery),
+
+    pub checkpoint: fn(r: &mut Recovery),
+
+    pub rollback: fn(r: &mut Recovery),
 }
 
 impl From<CongestionControlAlgorithm> for &'static CongestionControlOps {
@@ -994,7 +1016,7 @@ mod tests {
 
         // cwnd will be reset.
         r.collapse_cwnd();
-        assert_eq!(r.cwnd(), MINIMUM_WINDOW);
+        assert_eq!(r.cwnd(), r.max_datagram_size * MINIMUM_WINDOW_PACKETS);
     }
 
     #[test]

@@ -2423,7 +2423,7 @@ impl Connection {
         let mut left = b.cap();
 
         // Limit output packet size to respect peer's max_packet_size limit.
-        left = cmp::min(left, self.max_send_udp_payload_len());
+        left = cmp::min(left, self.max_send_udp_payload_size());
 
         let ignore_cc = self.dgram_send_queue.has_pending() &&
             self.dgram_ignore_cc;

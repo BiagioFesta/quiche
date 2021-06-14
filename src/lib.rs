@@ -555,6 +555,8 @@ pub struct Config {
     dgram_send_max_queue_len: usize,
 
     max_send_udp_payload_size: usize,
+
+    dgram_ignore_cc: bool,
 }
 
 // See https://quicwg.org/base-drafts/rfc9000.html#section-15
@@ -591,6 +593,8 @@ impl Config {
             dgram_send_max_queue_len: DEFAULT_MAX_DGRAM_QUEUE_LEN,
 
             max_send_udp_payload_size: MAX_SEND_UDP_PAYLOAD_SIZE,
+
+            dgram_ignore_cc: false,
         })
     }
 
@@ -928,6 +932,18 @@ impl Config {
         self.dgram_recv_max_queue_len = recv_queue_len;
         self.dgram_send_max_queue_len = send_queue_len;
     }
+
+    /// Configure whether datagrams should ignore congestion controll or not.
+    /// When this flag is enabled (`true`), the effects are:
+    ///    * Packets containg datagram frames are not bounded by CWND
+    ///      (i.e., window congestion control).
+    ///    * Datagram frames are marked as `NOT ack eliciting` and
+    ///      `NOT in flight`.
+    ///
+    /// The default value is `false`.
+    pub fn enable_dgram_ignore_cc(&mut self, v: bool) {
+        self.dgram_ignore_cc = v
+    }
 }
 
 /// A QUIC connection.
@@ -1107,6 +1123,9 @@ pub struct Connection {
 
     /// Whether to emit DATAGRAM frames in the next packet.
     emit_dgram: bool,
+
+    /// Whether DATAGRAMS ignore congestion control.
+    dgram_ignore_cc: bool,
 }
 
 /// Creates a new server-side connection.
@@ -1446,6 +1465,8 @@ impl Connection {
             ),
 
             emit_dgram: true,
+
+            dgram_ignore_cc: config.dgram_ignore_cc,
         });
 
         if let Some(odcid) = odcid {
@@ -2518,8 +2539,12 @@ impl Connection {
 
         let mut left = b.cap();
 
-        // Limit output packet size by congestion window size.
-        left = cmp::min(left, self.recovery.cwnd_available());
+        let ignore_cc =
+            self.dgram_send_queue.has_pending() && self.dgram_ignore_cc;
+        if !ignore_cc {
+            // Limit output packet size by congestion window size.
+            left = cmp::min(left, self.recovery.cwnd_available());
+        }
 
         let pn = self.pkt_num_spaces[epoch].next_pkt_num;
         let pn_len = packet::pkt_num_len(pn)?;
@@ -2940,8 +2965,8 @@ impl Connection {
                                 let frame = frame::Frame::Datagram { data };
 
                                 if push_frame_to_pkt!(b, frames, frame, left) {
-                                    ack_eliciting = true;
-                                    in_flight = true;
+                                    ack_eliciting = !self.dgram_ignore_cc;
+                                    in_flight = !self.dgram_ignore_cc;
                                     dgram_emitted = true;
                                 }
                             },

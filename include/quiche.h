@@ -202,6 +202,9 @@ void quiche_config_enable_dgram(quiche_config *config, bool enabled,
                                 size_t recv_queue_len,
                                 size_t send_queue_len);
 
+// Configure whether DATAGRAMS should ignore congestion control or not.
+void quiche_config_enable_dgram_ignore_cc(quiche_config *config, bool v);
+
 // Frees the config object.
 void quiche_config_free(quiche_config *config);
 

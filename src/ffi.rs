@@ -284,6 +284,11 @@ pub extern fn quiche_config_set_cc_algorithm(
 }
 
 #[no_mangle]
+pub extern fn quiche_config_enable_dgram_ignore_cc(config: &mut Config, v: bool) {
+    config.enable_dgram_ignore_cc(v)
+}
+
+#[no_mangle]
 pub extern fn quiche_config_enable_hystart(config: &mut Config, v: bool) {
     config.enable_hystart(v);
 }

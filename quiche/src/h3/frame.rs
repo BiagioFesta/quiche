@@ -39,7 +39,7 @@ pub const MAX_PUSH_FRAME_TYPE_ID: u64 = 0xD;
 pub const SETTINGS_QPACK_MAX_TABLE_CAPACITY: u64 = 0x1;
 pub const SETTINGS_MAX_FIELD_SECTION_SIZE: u64 = 0x6;
 pub const SETTINGS_QPACK_BLOCKED_STREAMS: u64 = 0x7;
-pub const SETTINGS_H3_DATAGRAM: u64 = 0x276;
+pub const SETTINGS_H3_DATAGRAM: u64 = 0xffd277;
 
 // Permit between 16 maximally-encoded and 128 minimally-encoded SETTINGS.
 const MAX_SETTINGS_PAYLOAD_SIZE: usize = 256;
@@ -481,7 +481,7 @@ mod tests {
             raw: Some(raw_settings),
         };
 
-        let frame_payload_len = 9;
+        let frame_payload_len = 11;
         let frame_header_len = 2;
 
         let wire_len = {
@@ -534,7 +534,7 @@ mod tests {
             raw: Some(raw_settings),
         };
 
-        let frame_payload_len = 11;
+        let frame_payload_len = 13;
         let frame_header_len = 2;
 
         let wire_len = {
@@ -606,7 +606,7 @@ mod tests {
             raw: Some(raw_settings),
         };
 
-        let frame_payload_len = 3;
+        let frame_payload_len = 5;
         let frame_header_len = 2;
 
         let wire_len = {
@@ -640,7 +640,7 @@ mod tests {
             raw: Default::default(),
         };
 
-        let frame_payload_len = 3;
+        let frame_payload_len = 5;
         let frame_header_len = 2;
 
         let wire_len = {

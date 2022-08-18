@@ -216,6 +216,9 @@ void quiche_config_enable_dgram(quiche_config *config, bool enabled,
                                 size_t recv_queue_len,
                                 size_t send_queue_len);
 
+// Configure whether DATAGRAMS should ignore congestion control or not.
+void quiche_config_enable_dgram_ignore_cc(quiche_config *config, bool v);
+
 // Sets the maximum connection window.
 void quiche_config_set_max_connection_window(quiche_config *config, uint64_t v);
 

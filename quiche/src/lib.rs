@@ -712,6 +712,7 @@ pub struct Config {
 
     cc_algorithm: CongestionControlAlgorithm,
     initial_congestion_window_packets: usize,
+    dgram_ignore_cc: bool,
 
     hystart: bool,
 
@@ -778,6 +779,7 @@ impl Config {
             cc_algorithm: CongestionControlAlgorithm::CUBIC,
             initial_congestion_window_packets:
                 DEFAULT_INITIAL_CONGESTION_WINDOW_PACKETS,
+            dgram_ignore_cc: false,
             hystart: true,
             pacing: true,
             max_pacing_rate: None,
@@ -1202,6 +1204,18 @@ impl Config {
         self.dgram_send_max_queue_len = send_queue_len;
     }
 
+    /// Configure whether datagrams should ignore congestion controll or not.
+    /// When this flag is enabled (`true`), the effects are:
+    ///    * Packets containg datagram frames are not bounded by CWND (i.e.,
+    ///      window congestion control).
+    ///    * Datagram frames are marked as `NOT ack eliciting` and `NOT in
+    ///      flight`.
+    ///
+    /// The default value is `false`.
+    pub fn enable_dgram_ignore_cc(&mut self, v: bool) {
+        self.dgram_ignore_cc = v
+    }
+
     /// Configures the max number of queued received PATH_CHALLENGE frames.
     ///
     /// When an endpoint receives a PATH_CHALLENGE frame and the queue is full,
@@ -1440,6 +1454,9 @@ pub struct Connection {
     /// DATAGRAM queues.
     dgram_recv_queue: dgram::DatagramQueue,
     dgram_send_queue: dgram::DatagramQueue,
+
+    /// Whether DATAGRAMS ignore congestion control.
+    dgram_ignore_cc: bool,
 
     /// Whether to emit DATAGRAM frames in the next packet.
     emit_dgram: bool,
@@ -1898,6 +1915,8 @@ impl Connection {
             dgram_send_queue: dgram::DatagramQueue::new(
                 config.dgram_send_max_queue_len,
             ),
+
+            dgram_ignore_cc: config.dgram_ignore_cc,
 
             emit_dgram: true,
 
@@ -3426,7 +3445,11 @@ impl Connection {
             }
         }
 
-        let is_app_limited = self.delivery_rate_check_if_app_limited();
+        let ignore_cc =
+            self.dgram_ignore_cc && self.dgram_send_queue.has_pending();
+
+        let is_app_limited =
+            !ignore_cc && self.delivery_rate_check_if_app_limited();
         let n_paths = self.paths.len();
         let path = self.paths.get_mut(send_pid)?;
         let flow_control = &mut self.flow_control;
@@ -3600,12 +3623,15 @@ impl Connection {
             }
         }
 
-        // Limit output packet size by congestion window size.
-        left = cmp::min(
-            left,
-            // Bytes consumed by ACK frames.
-            cwnd_available.saturating_sub(left_before_packing_ack_frame - left),
-        );
+        if !ignore_cc {
+            // Limit output packet size by congestion window size.
+            left = cmp::min(
+                left,
+                // Bytes consumed by ACK frames.
+                cwnd_available
+                    .saturating_sub(left_before_packing_ack_frame - left),
+            );
+        }
 
         let mut challenge_data = None;
 
@@ -4047,8 +4073,8 @@ impl Connection {
                                     frame::Frame::DatagramHeader { length: len };
 
                                 if push_frame_to_pkt!(b, frames, frame, left) {
-                                    ack_eliciting = true;
-                                    in_flight = true;
+                                    ack_eliciting = !self.dgram_ignore_cc;
+                                    in_flight = !self.dgram_ignore_cc;
                                     dgram_emitted = true;
                                 }
                             },

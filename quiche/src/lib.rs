@@ -720,6 +720,8 @@ pub struct Config {
 
     max_send_udp_payload_size: usize,
 
+    dgram_ignore_cc: bool,
+
     max_connection_window: u64,
     max_stream_window: u64,
 
@@ -781,6 +783,8 @@ impl Config {
             dgram_send_max_queue_len: DEFAULT_MAX_DGRAM_QUEUE_LEN,
 
             max_send_udp_payload_size: MAX_SEND_UDP_PAYLOAD_SIZE,
+
+            dgram_ignore_cc: false,
 
             max_connection_window: MAX_CONNECTION_WINDOW,
             max_stream_window: stream::MAX_STREAM_WINDOW,
@@ -1186,6 +1190,18 @@ impl Config {
         self.dgram_send_max_queue_len = send_queue_len;
     }
 
+    /// Configure whether datagrams should ignore congestion controll or not.
+    /// When this flag is enabled (`true`), the effects are:
+    ///    * Packets containg datagram frames are not bounded by CWND (i.e.,
+    ///      window congestion control).
+    ///    * Datagram frames are marked as `NOT ack eliciting` and `NOT in
+    ///      flight`.
+    ///
+    /// The default value is `false`.
+    pub fn enable_dgram_ignore_cc(&mut self, v: bool) {
+        self.dgram_ignore_cc = v
+    }
+
     /// Sets the maximum size of the connection window.
     ///
     /// The default value is MAX_CONNECTION_WINDOW (24MBytes).
@@ -1418,6 +1434,9 @@ pub struct Connection {
 
     /// A resusable buffer used by Recovery
     newly_acked: Vec<recovery::Acked>,
+
+    /// Whether DATAGRAMS ignore congestion control.
+    dgram_ignore_cc: bool,
 }
 
 /// Creates a new server-side connection.
@@ -1851,6 +1870,8 @@ impl Connection {
             disable_dcid_reuse: config.disable_dcid_reuse,
 
             newly_acked: Vec::new(),
+
+            dgram_ignore_cc: config.dgram_ignore_cc,
         };
 
         if let Some(odcid) = odcid {
@@ -3363,7 +3384,11 @@ impl Connection {
             }
         }
 
-        let is_app_limited = self.delivery_rate_check_if_app_limited();
+        let ignore_cc =
+            self.dgram_ignore_cc && self.dgram_send_queue.has_pending();
+
+        let is_app_limited =
+            !ignore_cc && self.delivery_rate_check_if_app_limited();
         let n_paths = self.paths.len();
         let path = self.paths.get_mut(send_pid)?;
         let flow_control = &mut self.flow_control;
@@ -3537,12 +3562,15 @@ impl Connection {
             }
         }
 
-        // Limit output packet size by congestion window size.
-        left = cmp::min(
-            left,
-            // Bytes consumed by ACK frames.
-            cwnd_available.saturating_sub(left_before_packing_ack_frame - left),
-        );
+        if !ignore_cc {
+            // Limit output packet size by congestion window size.
+            left = cmp::min(
+                left,
+                // Bytes consumed by ACK frames.
+                cwnd_available
+                    .saturating_sub(left_before_packing_ack_frame - left),
+            );
+        }
 
         let mut challenge_data = None;
 
@@ -3984,8 +4012,8 @@ impl Connection {
                                     frame::Frame::DatagramHeader { length: len };
 
                                 if push_frame_to_pkt!(b, frames, frame, left) {
-                                    ack_eliciting = true;
-                                    in_flight = true;
+                                    ack_eliciting = !self.dgram_ignore_cc;
+                                    in_flight = !self.dgram_ignore_cc;
                                     dgram_emitted = true;
                                 }
                             },

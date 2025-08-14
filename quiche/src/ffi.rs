@@ -372,6 +372,13 @@ pub extern "C" fn quiche_config_enable_dgram(
 }
 
 #[no_mangle]
+pub extern "C" fn quiche_config_enable_dgram_ignore_cc(
+    config: &mut Config, v: bool,
+) {
+    config.enable_dgram_ignore_cc(v)
+}
+
+#[no_mangle]
 pub extern "C" fn quiche_config_set_max_send_udp_payload_size(
     config: &mut Config, v: size_t,
 ) {
